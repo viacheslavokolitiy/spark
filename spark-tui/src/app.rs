@@ -125,7 +125,6 @@ impl App {
             }
         }
 
-        // Clone to avoid holding a shared borrow of `self` while calling &mut methods.
         match self.focus {
             Focus::History => self.handle_history_key(key),
             Focus::Method => self.handle_method_key(key),

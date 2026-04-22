@@ -60,11 +60,6 @@ pub struct App {
     pub status_message: String,
 }
 
-enum FocusType {
-    Prev,
-    Next
-}
-
 
 impl App {
     /// Creates a new [`App`], loading history from the path in `config`.

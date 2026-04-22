@@ -1,0 +1,11 @@
+[package]
+name = "spark-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sqlx = { version = "0.8.6", features = ["postgres"] }
+
+[lints.clippy]
+pedantic = "warn"
+missing_docs_in_private_items = "deny"

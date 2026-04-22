@@ -8,3 +8,7 @@ spark-core = { path = "../spark-core" }
 ratatui = { version = "0.30.0", features = ["default"] }
 crossterm = "0.29.0"
 color-eyre = "0.6.5"
+
+[lints.clippy]
+pedantic = "warn"
+missing_docs_in_private_items = "deny"

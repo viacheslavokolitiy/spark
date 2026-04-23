@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::io::Write;
 
+const SECONDS_IN_MINUTE: i64 = 60;
+const SECONDS_IN_HOUR: i64 = 3_600;
+const SECONDS_IN_DAY: i64 = 86_400;
+
 /// A single entry stored in the history file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -32,6 +36,58 @@ impl HistoryEntry  {
             body: req.body.clone(),
             timestamp: Utc::now(),
         }
+    }
+}
+
+/// Returns a human-readable relative time label for `timestamp`.
+///
+/// The label is stable per coarse time bucket (e.g. all entries from the same
+/// minute share a label), making it suitable as a group-separator header in the
+/// history sidebar.
+///
+/// # Examples
+///
+/// ```
+/// # use chrono::{Duration, Utc};
+/// # use spark_core::history::relative_time_label;
+/// let recent = Utc::now() - Duration::seconds(30);
+/// assert_eq!(relative_time_label(&recent), "Just now");
+/// ```
+#[must_use]
+pub fn relative_time_label(timestamp: &DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let diff = now.signed_duration_since(*timestamp);
+    let secs = diff.num_seconds().max(0);
+
+    if secs < SECONDS_IN_MINUTE {
+        return "Just now".to_string();
+    }
+    if secs < SECONDS_IN_HOUR {
+        let mins = diff.num_minutes();
+        return if mins == 1 {
+            "1 minute ago".to_string()
+        } else {
+            format!("{mins} minutes ago")
+        };
+    }
+    if secs < SECONDS_IN_DAY {
+        let hours = diff.num_hours();
+        return if hours == 1 {
+            "1 hour ago".to_string()
+        } else {
+            format!("{hours} hours ago")
+        };
+    }
+
+    let today = now.date_naive();
+    let entry_day = timestamp.date_naive();
+    let days = (today - entry_day).num_days();
+
+    match days {
+        0 | 1 => "Yesterday".to_string(),
+        2..=6 => format!("{days} days ago"),
+        7..=13 => "Last week".to_string(),
+        _ => "Older".to_string(),
     }
 }
 

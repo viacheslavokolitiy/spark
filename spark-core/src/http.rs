@@ -87,6 +87,8 @@ pub struct HttpResponse {
     pub headers: Vec<(String, String)>,
     /// Raw response body text.
     pub body: String,
+    /// Round-trip time in milliseconds (from sending the request to receiving the full response).
+    pub duration_ms: u128,
 }
 
 impl HttpRequest {
@@ -111,7 +113,10 @@ impl HttpRequest {
             cmd.arg("-d").arg(body);
         }
 
+        let start = std::time::Instant::now();
         let output = cmd.output()?;
+        let duration_ms = start.elapsed().as_millis();
+
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         if stdout.is_empty() {
@@ -119,12 +124,12 @@ impl HttpRequest {
             return Err(format!("curl error: {stderr}").into());
         }
 
-        parse_response(&stdout)
+        parse_response(&stdout, duration_ms)
     }
 }
 
 /// Parses the raw output of `curl -i` into an [`HttpResponse`].
-fn parse_response(raw: &str) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+fn parse_response(raw: &str, duration_ms: u128) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let (sep_pos, sep_len) = if let Some(p) = raw.find(CRLF_SEP) {
         (p, CRLF_SEP.len())
     } else if let Some(p) = raw.find(LF_SEP) {
@@ -155,6 +160,7 @@ fn parse_response(raw: &str) -> Result<HttpResponse, Box<dyn std::error::Error>>
         status_text,
         headers,
         body: body.to_string(),
+        duration_ms,
     })
 }
 

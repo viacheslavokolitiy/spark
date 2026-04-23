@@ -10,6 +10,9 @@ use spark_core::http::HttpMethod;
 
 use crate::app::{App, Focus};
 
+const MS_IN_SECONDS: u128 = 1_000;
+const MS_IN_SECONDS_FLOAT: f64 = 1_000.0;
+
 // ── Color helpers ────────────────────────────────────────────────────────────
 
 /// Returns the display colour for an HTTP method per the design spec.
@@ -32,6 +35,18 @@ fn status_color(code: u16) -> Color {
         400..=499 => Color::Red,
         500..=599 => Color::Magenta,
         _ => Color::White,
+    }
+}
+
+/// Formats a round-trip duration for display in the response title.
+///
+/// Values under one second are shown in milliseconds (`123ms`); values one
+/// second or above are shown with one decimal place in seconds (`1.2s`).
+fn format_duration(ms: u128) -> String {
+    if ms < MS_IN_SECONDS {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / MS_IN_SECONDS_FLOAT)
     }
 }
 
@@ -254,7 +269,12 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Response;
 
     let title = match &app.response {
-        Some(r) => format!(" Response  {} {} ", r.status_code, r.status_text),
+        Some(r) => format!(
+            " Response  {} {}  {} ",
+            r.status_code,
+            r.status_text,
+            format_duration(r.duration_ms),
+        ),
         None => " Response ".to_string(),
     };
 

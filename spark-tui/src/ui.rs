@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+use spark_core::history::relative_time_label;
 use spark_core::http::HttpMethod;
 
 use crate::app::{App, Focus};
@@ -87,19 +88,43 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::History;
 
-    let items: Vec<ListItem> = app
-        .history
-        .iter()
-        .map(|entry| {
-            let color = method_color(&entry.method);
-            let method_span = Span::styled(
-                format!("{:<7}", entry.method.as_str()),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            );
-            let url_span = Span::raw(entry.url.clone());
-            ListItem::new(Line::from(vec![method_span, url_span]))
-        })
-        .collect();
+    // Build the visual item list, inserting a separator row each time the
+    // relative-time bucket changes.  `visual_map[i]` is `Some(history_idx)`
+    // for real entries and `None` for separator rows.
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut visual_map: Vec<Option<usize>> = Vec::new();
+    let mut current_label: Option<String> = None;
+
+    for (idx, entry) in app.history.iter().enumerate() {
+        let label = relative_time_label(&entry.timestamp);
+
+        if current_label.as_deref() != Some(label.as_str()) {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  {label}"),
+                Style::default()
+                    .fg(Color::Rgb(120, 120, 120))
+                    .add_modifier(Modifier::ITALIC),
+            ))));
+            visual_map.push(None);
+            current_label = Some(label);
+        }
+
+        let color = method_color(&entry.method);
+        let method_span = Span::styled(
+            format!("{:<7}", entry.method.as_str()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+        let url_span = Span::raw(entry.url.clone());
+        items.push(ListItem::new(Line::from(vec![method_span, url_span])));
+        visual_map.push(Some(idx));
+    }
+
+    // Map the logical history_index back to its visual position.
+    let visual_selected = if app.history.is_empty() {
+        None
+    } else {
+        visual_map.iter().position(|v| *v == Some(app.history_index))
+    };
 
     let block = Block::default()
         .title(" History ")
@@ -107,9 +132,7 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style(focused));
 
     let mut list_state = ListState::default();
-    if !app.history.is_empty() {
-        list_state.select(Some(app.history_index));
-    }
+    list_state.select(visual_selected);
 
     let list = List::new(items)
         .block(block)

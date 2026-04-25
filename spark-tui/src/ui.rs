@@ -365,7 +365,7 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::raw(""));
 
             // Body
-            for line in resp.body.lines() {
+            for line in format_response_body(&resp.body).lines() {
                 lines.push(Line::raw(line.to_string()));
             }
 
@@ -381,6 +381,18 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// Formats response body text for display when a structured format is detected.
+fn format_response_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| body.to_string())
+}
+
 // ── Status bar ───────────────────────────────────────────────────────────────
 
 /// Renders the bottom status bar.
@@ -388,4 +400,30 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(app.status_message.as_str())
         .style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(para, area);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for response body rendering helpers.
+
+    use super::format_response_body;
+
+    /// Valid compact JSON is expanded for display.
+    #[test]
+    fn response_body_formats_json() {
+        let formatted = format_response_body(r#"{"name":"spark","items":[1,2]}"#);
+
+        assert_eq!(
+            formatted,
+            "{\n  \"items\": [\n    1,\n    2\n  ],\n  \"name\": \"spark\"\n}"
+        );
+    }
+
+    /// Non-JSON response bodies are preserved as-is.
+    #[test]
+    fn response_body_preserves_plain_text() {
+        let body = "not json\nsecond line";
+
+        assert_eq!(format_response_body(body), body);
+    }
 }

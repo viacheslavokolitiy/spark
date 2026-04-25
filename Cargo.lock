@@ -1391,6 +1391,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "ratatui",
+ "serde_json",
  "spark-core",
 ]
 

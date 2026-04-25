@@ -1393,6 +1393,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "spark-core",
+ "tui-piechart",
 ]
 
 [[package]]
@@ -1622,6 +1623,15 @@ dependencies = [
  "sharded-slab",
  "thread_local",
  "tracing-core",
+]
+
+[[package]]
+name = "tui-piechart"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915e84bac27f9da5db07a6836142199439f938cf1d79f720502166559a7f4d1a"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]

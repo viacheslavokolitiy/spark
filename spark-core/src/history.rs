@@ -24,6 +24,9 @@ pub struct HistoryEntry {
     pub headers: Vec<(String, String)>,
     /// Request body, if any was sent.
     pub body: Option<String>,
+    /// HTTP response status code, if a response was received.
+    #[serde(default)]
+    pub response_code: Option<u16>,
     /// UTC timestamp of when the request was executed.
     pub timestamp: DateTime<Utc>,
 }
@@ -37,7 +40,17 @@ impl HistoryEntry {
             url: req.url.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
+            response_code: None,
             timestamp: Utc::now(),
+        }
+    }
+
+    /// Creates a history entry from a completed request/response pair.
+    #[must_use]
+    pub fn from_response(req: &HttpRequest, response_code: u16) -> Self {
+        Self {
+            response_code: Some(response_code),
+            ..Self::from_request(req)
         }
     }
 }
@@ -141,4 +154,37 @@ pub fn append_history(path: &Path, entry: &HistoryEntry) -> anyhow::Result<()> {
     let json = serde_json::to_string(entry)?;
     writeln!(file, "{json}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for history JSON compatibility.
+
+    use super::*;
+
+    /// History entries without response codes still deserialize.
+    #[test]
+    fn history_entry_deserializes_without_response_code() {
+        let entry: HistoryEntry = serde_json::from_str(
+            r#"{"method":"Get","url":"https://example.com","headers":[],"body":null,"timestamp":"2026-04-25T00:00:00Z"}"#,
+        )
+        .expect("old history entry should deserialize");
+
+        assert_eq!(entry.response_code, None);
+    }
+
+    /// Response codes are persisted when present.
+    #[test]
+    fn history_entry_serializes_response_code() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com".to_string(),
+            headers: Vec::new(),
+            body: None,
+        };
+        let entry = HistoryEntry::from_response(&request, 201);
+        let json = serde_json::to_string(&entry).expect("history entry should serialize");
+
+        assert!(json.contains(r#""response_code":201"#));
+    }
 }

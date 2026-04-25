@@ -3,11 +3,14 @@
 use crate::http::{HttpMethod, HttpRequest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::io::Write;
+use std::path::Path;
 
+/// Number of seconds in one minute.
 const SECONDS_IN_MINUTE: i64 = 60;
+/// Number of seconds in one hour.
 const SECONDS_IN_HOUR: i64 = 3_600;
+/// Number of seconds in one day.
 const SECONDS_IN_DAY: i64 = 86_400;
 
 /// A single entry stored in the history file.
@@ -25,7 +28,7 @@ pub struct HistoryEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-impl HistoryEntry  {
+impl HistoryEntry {
     /// Creates a history entry from a completed [`HttpRequest`], timestamped now.
     #[must_use]
     pub fn from_request(req: &HttpRequest) -> Self {

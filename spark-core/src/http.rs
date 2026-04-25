@@ -101,7 +101,11 @@ impl HttpRequest {
     /// or the response cannot be parsed.
     pub fn execute(&self) -> Result<HttpResponse, Box<dyn std::error::Error>> {
         let mut cmd = std::process::Command::new("curl");
-        cmd.arg("-s").arg("-i").arg("-X").arg(self.method.as_str()).arg(&self.url);
+        cmd.arg("-s")
+            .arg("-i")
+            .arg("-X")
+            .arg(self.method.as_str())
+            .arg(&self.url);
 
         for (key, value) in &self.headers {
             cmd.arg("-H").arg(format!("{key}: {value}"));
@@ -129,7 +133,10 @@ impl HttpRequest {
 }
 
 /// Parses the raw output of `curl -i` into an [`HttpResponse`].
-fn parse_response(raw: &str, duration_ms: u128) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+fn parse_response(
+    raw: &str,
+    duration_ms: u128,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
     let (sep_pos, sep_len) = if let Some(p) = raw.find(CRLF_SEP) {
         (p, CRLF_SEP.len())
     } else if let Some(p) = raw.find(LF_SEP) {
@@ -140,7 +147,11 @@ fn parse_response(raw: &str, duration_ms: u128) -> Result<HttpResponse, Box<dyn 
     };
 
     let header_section = &raw[..sep_pos];
-    let body = if sep_pos < raw.len() { &raw[sep_pos + sep_len..] } else { "" };
+    let body = if sep_pos < raw.len() {
+        &raw[sep_pos + sep_len..]
+    } else {
+        ""
+    };
 
     let mut lines = header_section.lines();
     let status_line = lines.next().unwrap_or("");
@@ -170,6 +181,8 @@ fn parse_status_line(line: &str) -> Result<(u16, String), Box<dyn std::error::Er
     parts.next(); // skip "HTTP/x.x"
     let code_str = parts.next().unwrap_or("0");
     let text = parts.next().unwrap_or("").to_string();
-    let code = code_str.parse::<u16>().map_err(|_| format!("invalid status code: {code_str}"))?;
+    let code = code_str
+        .parse::<u16>()
+        .map_err(|_| format!("invalid status code: {code_str}"))?;
     Ok((code, text))
 }

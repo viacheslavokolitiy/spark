@@ -37,6 +37,8 @@ pub enum ResponseTab {
     Body,
     /// Shows request and response byte sizes.
     Sizes,
+    /// Shows response code distribution across history.
+    History,
 }
 
 /// Which text area a generic key handler should target.
@@ -416,7 +418,7 @@ impl App {
 
         match request.execute() {
             Ok(response) => {
-                let entry = HistoryEntry::from_request(&request);
+                let entry = HistoryEntry::from_response(&request, response.status_code);
                 let _ = append_history(&self.config.history_file, &entry);
                 self.status_message = format!(
                     "✓ {} {}  —  {}",
@@ -474,14 +476,20 @@ impl App {
     fn next_response_tab(&mut self) {
         self.response_tab = match self.response_tab {
             ResponseTab::Body => ResponseTab::Sizes,
-            ResponseTab::Sizes => ResponseTab::Body,
+            ResponseTab::Sizes => ResponseTab::History,
+            ResponseTab::History => ResponseTab::Body,
         };
         self.response_scroll = 0;
     }
 
     /// Selects the previous response pane tab.
     fn previous_response_tab(&mut self) {
-        self.next_response_tab();
+        self.response_tab = match self.response_tab {
+            ResponseTab::Body => ResponseTab::History,
+            ResponseTab::Sizes => ResponseTab::Body,
+            ResponseTab::History => ResponseTab::Sizes,
+        };
+        self.response_scroll = 0;
     }
 }
 

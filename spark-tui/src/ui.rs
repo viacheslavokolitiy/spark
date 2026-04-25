@@ -7,8 +7,11 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
-use spark_core::history::relative_time_label;
+use spark_core::history::{HistoryEntry, relative_time_label};
 use spark_core::http::{HttpMethod, HttpRequest, HttpResponse};
+use tui_piechart::{
+    LegendAlignment, LegendLayout, LegendPosition, PieChart, PieSlice, Resolution, symbols,
+};
 
 use crate::app::{App, Focus, ResponseTab};
 
@@ -352,9 +355,10 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let selected_tab = match app.response_tab {
         ResponseTab::Body => 0,
         ResponseTab::Sizes => 1,
+        ResponseTab::History => 2,
     };
 
-    let tabs = Tabs::new(["Body", "Sizes"])
+    let tabs = Tabs::new(["Body", "Sizes", "History"])
         .select(selected_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -364,12 +368,18 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         );
     frame.render_widget(tabs, rows[0]);
 
-    let content: Text = match &app.response {
-        None => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
-        Some(resp) => match app.response_tab {
-            ResponseTab::Body => render_response_body_text(resp),
-            ResponseTab::Sizes => render_response_size_text(app.last_request.as_ref(), resp),
-        },
+    if app.response_tab == ResponseTab::History {
+        render_response_history_chart(frame, &app.history, rows[1]);
+        return;
+    }
+
+    let content: Text = match (&app.response, app.response_tab) {
+        (None, _) => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
+        (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
+        (Some(resp), ResponseTab::Sizes) => {
+            render_response_size_text(app.last_request.as_ref(), resp)
+        }
+        (Some(_), ResponseTab::History) => Text::raw(String::new()),
     };
 
     let para = Paragraph::new(content)
@@ -377,6 +387,99 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((app.response_scroll, 0));
 
     frame.render_widget(para, rows[1]);
+}
+
+/// Counts response-code buckets represented in request history.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ResponseCodeBuckets {
+    /// Number of 2xx responses.
+    success_2xx: usize,
+    /// Number of 3xx responses.
+    success_3xx: usize,
+    /// Number of 4xx responses.
+    failure_4xx: usize,
+    /// Number of 5xx responses.
+    failure_5xx: usize,
+}
+
+impl ResponseCodeBuckets {
+    /// Returns total bucketed response count.
+    fn total(self) -> usize {
+        self.success_2xx + self.success_3xx + self.failure_4xx + self.failure_5xx
+    }
+}
+
+/// Renders the response-code history chart tab.
+fn render_response_history_chart(frame: &mut Frame, history: &[HistoryEntry], area: Rect) {
+    let buckets = response_code_buckets(history);
+    if buckets.total() == 0 {
+        frame.render_widget(Paragraph::new("No response codes in history yet."), area);
+        return;
+    }
+
+    let chart = PieChart::new(response_code_slices(buckets))
+        .show_legend(true)
+        .show_percentages(true)
+        .legend_position(LegendPosition::Right)
+        .legend_layout(LegendLayout::Vertical)
+        .legend_alignment(LegendAlignment::Left)
+        .resolution(Resolution::Braille)
+        .pie_char(symbols::PIE_CHAR_BLOCK)
+        .legend_marker(symbols::LEGEND_MARKER_CIRCLE);
+
+    frame.render_widget(chart, area);
+}
+
+/// Counts supported response code buckets in history.
+fn response_code_buckets(history: &[HistoryEntry]) -> ResponseCodeBuckets {
+    let mut buckets = ResponseCodeBuckets::default();
+
+    for code in history.iter().filter_map(|entry| entry.response_code) {
+        match code {
+            200..=299 => buckets.success_2xx += 1,
+            300..=399 => buckets.success_3xx += 1,
+            400..=499 => buckets.failure_4xx += 1,
+            500..=599 => buckets.failure_5xx += 1,
+            _ => {}
+        }
+    }
+
+    buckets
+}
+
+/// Converts bounded chart dimensions and counts into `f64`.
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// Builds non-empty pie slices for the status-code distribution.
+fn response_code_slices(buckets: ResponseCodeBuckets) -> Vec<PieSlice<'static>> {
+    [
+        ("2xx success", buckets.success_2xx, 0),
+        ("3xx redirect", buckets.success_3xx, 1),
+        ("4xx client", buckets.failure_4xx, 2),
+        ("5xx server", buckets.failure_5xx, 3),
+    ]
+    .into_iter()
+    .filter(|(_, count, _)| *count > 0)
+    .map(|(label, count, bucket_idx)| {
+        PieSlice::new(
+            label,
+            usize_to_f64(count),
+            response_bucket_color(bucket_idx),
+        )
+    })
+    .collect()
+}
+
+/// Returns the configured color for a response-code bucket index.
+fn response_bucket_color(bucket_idx: usize) -> Color {
+    match bucket_idx {
+        0 => Color::Green,
+        1 => Color::Yellow,
+        2 => Color::Red,
+        _ => Color::Rgb(255, 0, 0),
+    }
 }
 
 /// Builds response body tab text.
@@ -484,7 +587,12 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     //! Tests for response body rendering helpers.
 
-    use super::{body_bytes, format_response_body, header_bytes};
+    use spark_core::{
+        history::HistoryEntry,
+        http::{HttpMethod, HttpRequest},
+    };
+
+    use super::{body_bytes, format_response_body, header_bytes, response_code_buckets};
 
     /// Valid compact JSON is expanded for display.
     #[test]
@@ -521,5 +629,43 @@ mod tests {
     fn body_size_counts_utf8_bytes() {
         assert_eq!(body_bytes(Some("é")), 2);
         assert_eq!(body_bytes(None), 0);
+    }
+
+    /// Response code history is counted into the four displayed buckets.
+    #[test]
+    fn response_code_buckets_count_supported_status_ranges() {
+        let history = vec![
+            history_entry(Some(200)),
+            history_entry(Some(204)),
+            history_entry(Some(301)),
+            history_entry(Some(404)),
+            history_entry(Some(500)),
+            history_entry(Some(503)),
+            history_entry(Some(102)),
+            history_entry(None),
+        ];
+
+        let buckets = response_code_buckets(&history);
+
+        assert_eq!(buckets.success_2xx, 2);
+        assert_eq!(buckets.success_3xx, 1);
+        assert_eq!(buckets.failure_4xx, 1);
+        assert_eq!(buckets.failure_5xx, 2);
+        assert_eq!(buckets.total(), 6);
+    }
+
+    /// Creates a history entry with the provided response code.
+    fn history_entry(response_code: Option<u16>) -> HistoryEntry {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com".to_string(),
+            headers: Vec::new(),
+            body: None,
+        };
+
+        response_code.map_or_else(
+            || HistoryEntry::from_request(&request),
+            |code| HistoryEntry::from_response(&request, code),
+        )
     }
 }

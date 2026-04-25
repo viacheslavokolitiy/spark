@@ -40,7 +40,6 @@ pub enum ResponseTab {
 }
 
 /// Which text area a generic key handler should target.
-#[derive(Clone, Copy)]
 enum TextAreaTarget {
     /// Headers editor.
     Headers,

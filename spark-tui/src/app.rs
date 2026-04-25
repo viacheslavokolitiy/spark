@@ -1,3 +1,5 @@
+//! Application state, focus management, input handling, and request actions.
+
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::Backend};
@@ -14,6 +16,8 @@ use crate::input::TextInput;
 pub enum Focus {
     /// Request history sidebar.
     History,
+    /// Request history search field.
+    Search,
     /// HTTP method selector.
     Method,
     /// URL input field.
@@ -28,7 +32,9 @@ pub enum Focus {
 
 /// Which text area a generic key handler should target.
 enum TextAreaTarget {
+    /// Headers editor.
     Headers,
+    /// Body editor.
     Body,
 }
 
@@ -46,6 +52,8 @@ pub struct App {
     pub headers: TextInput,
     /// Request body input.
     pub body: TextInput,
+    /// Request history search input.
+    pub history_search: TextInput,
     /// Loaded request history (oldest first).
     pub history: Vec<HistoryEntry>,
     /// Currently selected row in the history list.
@@ -60,7 +68,6 @@ pub struct App {
     pub status_message: String,
 }
 
-
 impl App {
     /// Creates a new [`App`], loading history from the path in `config`.
     pub fn new(config: Config) -> Self {
@@ -73,6 +80,7 @@ impl App {
             url: TextInput::single_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
+            history_search: TextInput::single_line(),
             history,
             history_index,
             response: None,
@@ -127,6 +135,7 @@ impl App {
 
         match self.focus {
             Focus::History => self.handle_history_key(key),
+            Focus::Search => self.handle_search_key(key),
             Focus::Method => self.handle_method_key(key),
             Focus::Url => self.handle_url_key(key),
             Focus::Headers => self.handle_text_area_key(key, TextAreaTarget::Headers),
@@ -140,10 +149,25 @@ impl App {
         &HttpMethod::all()[self.method_index]
     }
 
+    /// Returns indexes of history entries matching the active search query.
+    #[must_use]
+    pub fn filtered_history_indices(&self) -> Vec<usize> {
+        let query = self.history_search.content();
+        let query = query.trim();
+
+        self.history
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| history_matches(entry, query).then_some(idx))
+            .collect()
+    }
+
     // ── Focus cycling ────────────────────────────────────────────────────────
+    /// Moves focus to the next pane in tab order.
     fn next_focus(&mut self) {
         self.focus = match self.focus {
-            Focus::History => Focus::Method,
+            Focus::History => Focus::Search,
+            Focus::Search => Focus::Method,
             Focus::Method => Focus::Url,
             Focus::Url => Focus::Headers,
             Focus::Headers => Focus::Body,
@@ -152,10 +176,12 @@ impl App {
         };
     }
 
+    /// Moves focus to the previous pane in tab order.
     fn prev_focus(&mut self) {
         self.focus = match self.focus {
             Focus::History => Focus::Response,
-            Focus::Method => Focus::History,
+            Focus::Search => Focus::History,
+            Focus::Method => Focus::Search,
             Focus::Url => Focus::Method,
             Focus::Headers => Focus::Url,
             Focus::Body => Focus::Headers,
@@ -165,18 +191,16 @@ impl App {
 
     // ── Per-pane key handlers ────────────────────────────────────────────────
 
+    /// Handles key input while the request history list is focused.
     fn handle_history_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => self.next_focus(),
             KeyCode::BackTab => self.prev_focus(),
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.history.is_empty() {
-                    self.history_index =
-                        (self.history_index + 1).min(self.history.len() - 1);
-                }
+                self.select_next_visible_history();
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.history_index = self.history_index.saturating_sub(1);
+                self.select_previous_visible_history();
             }
             KeyCode::Enter => self.load_from_history(),
             KeyCode::Char('q') => self.should_quit = true,
@@ -184,13 +208,43 @@ impl App {
         }
     }
 
+    /// Handles key input while the request history search field is focused.
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Tab => {
+                self.next_focus();
+            }
+            KeyCode::BackTab => {
+                self.prev_focus();
+            }
+            KeyCode::Left => self.history_search.move_left(),
+            KeyCode::Right => self.history_search.move_right(),
+            KeyCode::Home => self.history_search.move_to_line_start(),
+            KeyCode::End => self.history_search.move_to_line_end(),
+            KeyCode::Backspace => {
+                self.history_search.backspace();
+                self.select_latest_visible_history();
+            }
+            KeyCode::Char(c) => {
+                self.history_search.insert_char(c);
+                self.select_latest_visible_history();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles key input while the HTTP method selector is focused.
     fn handle_method_key(&mut self, key: KeyEvent) {
         let count = HttpMethod::all().len();
         match key.code {
             KeyCode::Tab => self.next_focus(),
             KeyCode::BackTab => self.prev_focus(),
             KeyCode::Left | KeyCode::Char('h') => {
-                self.method_index = if self.method_index == 0 { count - 1 } else { self.method_index - 1 };
+                self.method_index = if self.method_index == 0 {
+                    count - 1
+                } else {
+                    self.method_index - 1
+                };
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 self.method_index = (self.method_index + 1) % count;
@@ -200,11 +254,21 @@ impl App {
         }
     }
 
+    /// Handles key input while the URL field is focused.
     fn handle_url_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Tab => { self.next_focus(); return; }
-            KeyCode::BackTab => { self.prev_focus(); return; }
-            KeyCode::Enter => { self.send_request(); return; }
+            KeyCode::Tab => {
+                self.next_focus();
+                return;
+            }
+            KeyCode::BackTab => {
+                self.prev_focus();
+                return;
+            }
+            KeyCode::Enter => {
+                self.send_request();
+                return;
+            }
             _ => {}
         }
         match key.code {
@@ -218,11 +282,18 @@ impl App {
         }
     }
 
+    /// Handles key input for the headers or body text area.
     fn handle_text_area_key(&mut self, key: KeyEvent, target: TextAreaTarget) {
         // Handle focus-change keys before borrowing the target area.
         match key.code {
-            KeyCode::Tab => { self.next_focus(); return; }
-            KeyCode::BackTab => { self.prev_focus(); return; }
+            KeyCode::Tab => {
+                self.next_focus();
+                return;
+            }
+            KeyCode::BackTab => {
+                self.prev_focus();
+                return;
+            }
             _ => {}
         }
 
@@ -245,6 +316,7 @@ impl App {
         }
     }
 
+    /// Handles key input while the response viewer is focused.
     fn handle_response_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => self.next_focus(),
@@ -265,9 +337,20 @@ impl App {
 
     /// Loads the selected history entry into the request composer.
     fn load_from_history(&mut self) {
+        if !self
+            .filtered_history_indices()
+            .contains(&self.history_index)
+        {
+            self.select_latest_visible_history();
+        }
+
         let Some(entry) = self.history.get(self.history_index) else {
             return;
         };
+
+        if !history_matches(entry, self.history_search.content().trim()) {
+            return;
+        }
 
         if let Some(idx) = HttpMethod::all().iter().position(|m| *m == entry.method) {
             self.method_index = idx;
@@ -300,19 +383,31 @@ impl App {
         let method = self.current_method().clone();
         let headers = parse_headers(&self.headers.content());
         let body_text = self.body.content();
-        let body = if body_text.trim().is_empty() { None } else { Some(body_text) };
+        let body = if body_text.trim().is_empty() {
+            None
+        } else {
+            Some(body_text)
+        };
 
-        let request = HttpRequest { method, url, headers, body };
+        let request = HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+        };
         self.status_message = format!("Sending {} {}…", request.method, request.url);
 
         match request.execute() {
             Ok(response) => {
                 let entry = HistoryEntry::from_request(&request);
                 let _ = append_history(&self.config.history_file, &entry);
-                self.status_message =
-                    format!("✓ {} {}  —  {}", request.method, request.url, response.status_code);
+                self.status_message = format!(
+                    "✓ {} {}  —  {}",
+                    request.method, request.url, response.status_code
+                );
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
+                self.select_latest_visible_history();
                 self.response = Some(response);
                 self.response_scroll = 0;
                 self.focus = Focus::Response;
@@ -320,6 +415,39 @@ impl App {
             Err(e) => {
                 self.status_message = format!("Error: {e}");
             }
+        }
+    }
+
+    /// Selects the next entry in the currently visible history list.
+    fn select_next_visible_history(&mut self) {
+        let visible = self.filtered_history_indices();
+        let Some(current_pos) = visible.iter().position(|idx| *idx == self.history_index) else {
+            self.select_latest_visible_history();
+            return;
+        };
+
+        if let Some(next_idx) = visible.get(current_pos + 1) {
+            self.history_index = *next_idx;
+        }
+    }
+
+    /// Selects the previous entry in the currently visible history list.
+    fn select_previous_visible_history(&mut self) {
+        let visible = self.filtered_history_indices();
+        let Some(current_pos) = visible.iter().position(|idx| *idx == self.history_index) else {
+            self.select_latest_visible_history();
+            return;
+        };
+
+        if current_pos > 0 {
+            self.history_index = visible[current_pos - 1];
+        }
+    }
+
+    /// Selects the newest history entry currently visible after filtering.
+    fn select_latest_visible_history(&mut self) {
+        if let Some(idx) = self.filtered_history_indices().last() {
+            self.history_index = *idx;
         }
     }
 }
@@ -330,7 +458,190 @@ fn parse_headers(text: &str) -> Vec<(String, String)> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| {
             let colon = l.find(':')?;
-            Some((l[..colon].trim().to_string(), l[colon + 1..].trim().to_string()))
+            Some((
+                l[..colon].trim().to_string(),
+                l[colon + 1..].trim().to_string(),
+            ))
         })
         .collect()
+}
+
+/// Returns whether a history entry matches the search query.
+fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    entry.method.as_str().to_lowercase().contains(&query)
+        || entry.url.to_lowercase().contains(&query)
+        || entry.headers.iter().any(|(key, value)| {
+            key.to_lowercase().contains(&query) || value.to_lowercase().contains(&query)
+        })
+        || entry
+            .body
+            .as_deref()
+            .is_some_and(|body| body.to_lowercase().contains(&query))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for request history filtering and selection behavior.
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    /// Creates an app with deterministic in-memory history.
+    fn app_with_history(history: Vec<HistoryEntry>) -> App {
+        let mut app = App::new(Config {
+            history_file: std::env::temp_dir().join(format!(
+                "spark-tui-test-history-{}.jsonl",
+                std::process::id()
+            )),
+        });
+        app.history = history;
+        app.history_index = app.history.len().saturating_sub(1);
+        app
+    }
+
+    /// Creates a request history entry for tests.
+    fn history_entry(
+        method: HttpMethod,
+        url: &str,
+        headers: Vec<(String, String)>,
+        body: Option<&str>,
+    ) -> HistoryEntry {
+        HistoryEntry::from_request(&HttpRequest {
+            method,
+            url: url.to_string(),
+            headers,
+            body: body.map(ToString::to_string),
+        })
+    }
+
+    /// Builds a plain key event for input handler tests.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Empty search returns every history entry.
+    #[test]
+    fn empty_history_search_shows_all_requests() {
+        let app = app_with_history(vec![
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Post,
+                "https://example.com/orders",
+                Vec::new(),
+                None,
+            ),
+        ]);
+
+        assert_eq!(app.filtered_history_indices(), vec![0, 1]);
+    }
+
+    /// Search matches method, URL, headers, and request body.
+    #[test]
+    fn history_search_matches_request_parts_case_insensitively() {
+        let mut app = app_with_history(vec![
+            history_entry(
+                HttpMethod::Post,
+                "https://example.com/orders",
+                vec![("Authorization".to_string(), "Bearer token".to_string())],
+                Some("{\"status\":\"pending\"}"),
+            ),
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users",
+                Vec::new(),
+                None,
+            ),
+        ]);
+
+        app.history_search.set_content("POST");
+        assert_eq!(app.filtered_history_indices(), vec![0]);
+
+        app.history_search.set_content("USERS");
+        assert_eq!(app.filtered_history_indices(), vec![1]);
+
+        app.history_search.set_content("bearer");
+        assert_eq!(app.filtered_history_indices(), vec![0]);
+
+        app.history_search.set_content("pending");
+        assert_eq!(app.filtered_history_indices(), vec![0]);
+    }
+
+    /// Typing in the search field selects the newest matching request.
+    #[test]
+    fn search_input_selects_latest_visible_request() {
+        let mut app = app_with_history(vec![
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users/1",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/orders",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users/2",
+                Vec::new(),
+                None,
+            ),
+        ]);
+        app.focus = Focus::Search;
+
+        for c in "users".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+
+        assert_eq!(app.filtered_history_indices(), vec![0, 2]);
+        assert_eq!(app.history_index, 2);
+    }
+
+    /// History navigation moves only through visible filtered requests.
+    #[test]
+    fn history_navigation_uses_filtered_requests() {
+        let mut app = app_with_history(vec![
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users/1",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/orders",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users/2",
+                Vec::new(),
+                None,
+            ),
+        ]);
+        app.history_search.set_content("users");
+        app.select_latest_visible_history();
+
+        app.handle_history_key(key(KeyCode::Up));
+
+        assert_eq!(app.history_index, 0);
+
+        app.handle_history_key(key(KeyCode::Down));
+
+        assert_eq!(app.history_index, 2);
+    }
 }

@@ -1,3 +1,5 @@
+//! Editable single-line and multi-line text input state.
+
 /// A simple text input that supports both single-line and multi-line editing.
 #[derive(Debug)]
 pub struct TextInput {
@@ -146,8 +148,5 @@ impl TextInput {
 
 /// Converts a character index to the corresponding byte offset in `s`.
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+    s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
 }

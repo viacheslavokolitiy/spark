@@ -1,3 +1,5 @@
+//! Terminal entry point for the Spark TUI application.
+
 use color_eyre::Result;
 use crossterm::{
     execute,
@@ -11,6 +13,7 @@ mod app;
 mod input;
 mod ui;
 
+/// Starts the TUI and restores the terminal before returning.
 fn main() -> Result<()> {
     color_eyre::install()?;
 

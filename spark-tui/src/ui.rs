@@ -1,3 +1,5 @@
+//! Rendering functions for the Spark terminal interface.
+
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -10,8 +12,8 @@ use spark_core::http::HttpMethod;
 
 use crate::app::{App, Focus};
 
+/// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
-const MS_IN_SECONDS_FLOAT: f64 = 1_000.0;
 
 // ── Color helpers ────────────────────────────────────────────────────────────
 
@@ -46,8 +48,15 @@ fn format_duration(ms: u128) -> String {
     if ms < MS_IN_SECONDS {
         format!("{ms}ms")
     } else {
-        format!("{:.1}s", ms as f64 / MS_IN_SECONDS_FLOAT)
+        let millis = u64::try_from(ms).unwrap_or(u64::MAX);
+        let seconds = std::time::Duration::from_millis(millis).as_secs_f64();
+        format!("{seconds:.1}s")
     }
+}
+
+/// Converts a cursor index to a terminal coordinate offset.
+fn cursor_offset(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 /// Border style for a focused vs unfocused block.
@@ -92,7 +101,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let composer_area = central_rows[0];
     let response_area = central_rows[1];
 
-    render_history(frame, app, sidebar_area);
+    render_sidebar(frame, app, sidebar_area);
     render_composer(frame, app, composer_area);
     render_response(frame, app, response_area);
     render_status(frame, app, status_area);
@@ -100,6 +109,37 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 
+/// Renders the history search field and filtered request history list.
+fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(area);
+
+    render_history_search(frame, app, rows[0]);
+    render_history(frame, app, rows[1]);
+}
+
+/// Renders the request history search input.
+fn render_history_search(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Search;
+    let block = Block::default()
+        .title(" Search ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let para = Paragraph::new(app.history_search.content()).block(block);
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(app.history_search.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = area.y + 1;
+        frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Renders the filtered request history list.
 fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::History;
 
@@ -109,8 +149,10 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_map: Vec<Option<usize>> = Vec::new();
     let mut current_label: Option<String> = None;
+    let filtered_indices = app.filtered_history_indices();
 
-    for (idx, entry) in app.history.iter().enumerate() {
+    for idx in &filtered_indices {
+        let entry = &app.history[*idx];
         let label = relative_time_label(&entry.timestamp);
 
         if current_label.as_deref() != Some(label.as_str()) {
@@ -131,14 +173,24 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
         );
         let url_span = Span::raw(entry.url.clone());
         items.push(ListItem::new(Line::from(vec![method_span, url_span])));
-        visual_map.push(Some(idx));
+        visual_map.push(Some(*idx));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No matching requests",
+            Style::default().fg(Color::DarkGray),
+        ))));
+        visual_map.push(None);
     }
 
     // Map the logical history_index back to its visual position.
-    let visual_selected = if app.history.is_empty() {
+    let visual_selected = if filtered_indices.is_empty() {
         None
     } else {
-        visual_map.iter().position(|v| *v == Some(app.history_index))
+        visual_map
+            .iter()
+            .position(|v| *v == Some(app.history_index))
     };
 
     let block = Block::default()
@@ -149,15 +201,18 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     let mut list_state = ListState::default();
     list_state.select(visual_selected);
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 // ── Composer ─────────────────────────────────────────────────────────────────
 
+/// Renders the request composer pane.
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     // Split composer: [method + URL row] | [headers] | [body]
     let rows = Layout::default()
@@ -174,6 +229,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     render_body(frame, app, rows[2]);
 }
 
+/// Renders the method selector and URL input row.
 fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
     // Split: [method selector (12 cols)] | [URL input]
     let cols = Layout::default()
@@ -214,13 +270,14 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
 
     if url_focused {
         // x+1 / y+1 to step inside the border
-        let cx = (url_area.x + 1 + app.url.cursor_col as u16)
+        let cx = (url_area.x + 1 + cursor_offset(app.url.cursor_col))
             .min(url_area.x + url_area.width.saturating_sub(2));
         let cy = url_area.y + 1;
         frame.set_cursor_position((cx, cy));
     }
 }
 
+/// Renders the headers editor.
 fn render_headers(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Headers;
     let block = Block::default()
@@ -234,14 +291,15 @@ fn render_headers(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 
     if focused {
-        let cx = (area.x + 1 + app.headers.cursor_col as u16)
+        let cx = (area.x + 1 + cursor_offset(app.headers.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + app.headers.cursor_row as u16)
+        let cy = (area.y + 1 + cursor_offset(app.headers.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
 }
 
+/// Renders the request body editor.
 fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Body;
     let block = Block::default()
@@ -255,9 +313,9 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 
     if focused {
-        let cx = (area.x + 1 + app.body.cursor_col as u16)
+        let cx = (area.x + 1 + cursor_offset(app.body.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + app.body.cursor_row as u16)
+        let cy = (area.y + 1 + cursor_offset(app.body.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
@@ -265,6 +323,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
 
 // ── Response viewer ──────────────────────────────────────────────────────────
 
+/// Renders the response viewer pane.
 fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Response;
 
@@ -324,6 +383,7 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
 
 // ── Status bar ───────────────────────────────────────────────────────────────
 
+/// Renders the bottom status bar.
 fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(app.status_message.as_str())
         .style(Style::default().fg(Color::White).bg(Color::DarkGray));

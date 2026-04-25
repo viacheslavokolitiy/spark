@@ -5,12 +5,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use spark_core::history::relative_time_label;
-use spark_core::http::HttpMethod;
+use spark_core::http::{HttpMethod, HttpRequest, HttpResponse};
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, ResponseTab};
 
 /// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
@@ -341,44 +341,122 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    let selected_tab = match app.response_tab {
+        ResponseTab::Body => 0,
+        ResponseTab::Sizes => 1,
+    };
+
+    let tabs = Tabs::new(["Body", "Sizes"])
+        .select(selected_tab)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(tabs, rows[0]);
 
     let content: Text = match &app.response {
         None => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
-        Some(resp) => {
-            let mut lines: Vec<Line> = Vec::new();
-            let sc = status_color(resp.status_code);
-
-            // Status line
-            lines.push(Line::from(Span::styled(
-                format!("{} {}", resp.status_code, resp.status_text),
-                Style::default().fg(sc).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::raw(""));
-
-            // Response headers
-            for (k, v) in &resp.headers {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
-                    Span::raw(v.clone()),
-                ]));
-            }
-            lines.push(Line::raw(""));
-
-            // Body
-            for line in format_response_body(&resp.body).lines() {
-                lines.push(Line::raw(line.to_string()));
-            }
-
-            Text::from(lines)
-        }
+        Some(resp) => match app.response_tab {
+            ResponseTab::Body => render_response_body_text(resp),
+            ResponseTab::Sizes => render_response_size_text(app.last_request.as_ref(), resp),
+        },
     };
 
     let para = Paragraph::new(content)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((app.response_scroll, 0));
 
-    frame.render_widget(para, area);
+    frame.render_widget(para, rows[1]);
+}
+
+/// Builds response body tab text.
+fn render_response_body_text(resp: &HttpResponse) -> Text<'static> {
+    let mut lines: Vec<Line> = Vec::new();
+    let sc = status_color(resp.status_code);
+
+    lines.push(Line::from(Span::styled(
+        format!("{} {}", resp.status_code, resp.status_text),
+        Style::default().fg(sc).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::raw(""));
+
+    for (k, v) in &resp.headers {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
+            Span::raw(v.clone()),
+        ]));
+    }
+    lines.push(Line::raw(""));
+
+    for line in format_response_body(&resp.body).lines() {
+        lines.push(Line::raw(line.to_string()));
+    }
+
+    Text::from(lines)
+}
+
+/// Builds response size tab text.
+fn render_response_size_text(req: Option<&HttpRequest>, resp: &HttpResponse) -> Text<'static> {
+    let response_headers = header_bytes(&resp.headers);
+    let response_body = body_bytes(Some(resp.body.as_str()));
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Request",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    if let Some(req) = req {
+        let request_headers = header_bytes(&req.headers);
+        let request_body = body_bytes(req.body.as_deref());
+        lines.push(size_line("Headers", request_headers));
+        lines.push(size_line("Body", request_body));
+        lines.push(size_line("Total", request_headers + request_body));
+    } else {
+        lines.push(Line::raw("No request captured."));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Response",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(size_line("Headers", response_headers));
+    lines.push(size_line("Body", response_body));
+    lines.push(size_line("Total", response_headers + response_body));
+
+    Text::from(lines)
+}
+
+/// Builds one byte-size display line.
+fn size_line(label: &str, bytes: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<8}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{bytes} bytes")),
+    ])
+}
+
+/// Returns the byte count for header lines serialized as `Name: Value\r\n`.
+fn header_bytes(headers: &[(String, String)]) -> usize {
+    headers
+        .iter()
+        .map(|(key, value)| key.len() + ": ".len() + value.len() + "\r\n".len())
+        .sum()
+}
+
+/// Returns the byte count for an optional body.
+fn body_bytes(body: Option<&str>) -> usize {
+    body.map_or(0, str::len)
 }
 
 /// Formats response body text for display when a structured format is detected.
@@ -406,7 +484,7 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     //! Tests for response body rendering helpers.
 
-    use super::format_response_body;
+    use super::{body_bytes, format_response_body, header_bytes};
 
     /// Valid compact JSON is expanded for display.
     #[test]
@@ -425,5 +503,23 @@ mod tests {
         let body = "not json\nsecond line";
 
         assert_eq!(format_response_body(body), body);
+    }
+
+    /// Header byte size uses HTTP-style serialized header lines.
+    #[test]
+    fn header_size_counts_serialized_header_bytes() {
+        let headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("X-Test".to_string(), "ok".to_string()),
+        ];
+
+        assert_eq!(header_bytes(&headers), 44);
+    }
+
+    /// Body byte size uses UTF-8 bytes rather than character count.
+    #[test]
+    fn body_size_counts_utf8_bytes() {
+        assert_eq!(body_bytes(Some("é")), 2);
+        assert_eq!(body_bytes(None), 0);
     }
 }

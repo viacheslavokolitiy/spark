@@ -30,7 +30,17 @@ pub enum Focus {
     Response,
 }
 
+/// Selected tab in the response pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseTab {
+    /// Shows status, headers, and body content.
+    Body,
+    /// Shows request and response byte sizes.
+    Sizes,
+}
+
 /// Which text area a generic key handler should target.
+#[derive(Clone, Copy)]
 enum TextAreaTarget {
     /// Headers editor.
     Headers,
@@ -60,6 +70,10 @@ pub struct App {
     pub history_index: usize,
     /// Most recent HTTP response.
     pub response: Option<HttpResponse>,
+    /// Request that produced the most recent response.
+    pub last_request: Option<HttpRequest>,
+    /// Active tab in the response pane.
+    pub response_tab: ResponseTab,
     /// Vertical scroll offset for the response viewer.
     pub response_scroll: u16,
     /// Set to `true` to exit the event loop.
@@ -84,6 +98,8 @@ impl App {
             history,
             history_index,
             response: None,
+            last_request: None,
+            response_tab: ResponseTab::Body,
             response_scroll: 0,
             should_quit: false,
             status_message: String::from(
@@ -321,6 +337,8 @@ impl App {
         match key.code {
             KeyCode::Tab => self.next_focus(),
             KeyCode::BackTab => self.prev_focus(),
+            KeyCode::Left | KeyCode::Char('h') => self.previous_response_tab(),
+            KeyCode::Right | KeyCode::Char('l') => self.next_response_tab(),
             KeyCode::Down | KeyCode::Char('j') => {
                 self.response_scroll = self.response_scroll.saturating_add(1);
             }
@@ -408,7 +426,9 @@ impl App {
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
                 self.select_latest_visible_history();
+                self.last_request = Some(request);
                 self.response = Some(response);
+                self.response_tab = ResponseTab::Body;
                 self.response_scroll = 0;
                 self.focus = Focus::Response;
             }
@@ -449,6 +469,20 @@ impl App {
         if let Some(idx) = self.filtered_history_indices().last() {
             self.history_index = *idx;
         }
+    }
+
+    /// Selects the next response pane tab.
+    fn next_response_tab(&mut self) {
+        self.response_tab = match self.response_tab {
+            ResponseTab::Body => ResponseTab::Sizes,
+            ResponseTab::Sizes => ResponseTab::Body,
+        };
+        self.response_scroll = 0;
+    }
+
+    /// Selects the previous response pane tab.
+    fn previous_response_tab(&mut self) {
+        self.next_response_tab();
     }
 }
 

@@ -1,5 +1,7 @@
 //! Editable single-line and multi-line text input state.
 
+use std::borrow::Cow;
+
 /// A simple text input that supports both single-line and multi-line editing.
 #[derive(Debug)]
 pub struct TextInput {
@@ -43,6 +45,15 @@ impl TextInput {
     /// Returns the full text content with lines joined by `\n`.
     pub fn content(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Returns the full text content, borrowing when no join is needed.
+    pub fn text(&self) -> Cow<'_, str> {
+        if let [line] = self.lines.as_slice() {
+            Cow::Borrowed(line)
+        } else {
+            Cow::Owned(self.content())
+        }
     }
 
     /// Replaces content, placing the cursor at the end.

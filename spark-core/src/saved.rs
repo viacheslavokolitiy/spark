@@ -29,7 +29,7 @@ impl SavedRequest {
     pub fn from_request(req: &HttpRequest) -> Self {
         Self {
             name: format!("{} {}", req.method, req.url),
-            method: req.method.clone(),
+            method: req.method,
             url: req.url.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),

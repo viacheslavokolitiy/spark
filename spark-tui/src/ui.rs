@@ -10,6 +10,7 @@ use ratatui::{
 use spark_core::history::{HistoryEntry, relative_time_label};
 use spark_core::http::{HttpMethod, HttpRequest, HttpResponse};
 use spark_core::saved::SavedRequest;
+use std::borrow::Cow;
 use tui_piechart::{
     LegendAlignment, LegendLayout, LegendPosition, PieChart, PieSlice, Resolution, symbols,
 };
@@ -22,7 +23,7 @@ const MS_IN_SECONDS: u128 = 1_000;
 // ── Color helpers ────────────────────────────────────────────────────────────
 
 /// Returns the display colour for an HTTP method per the design spec.
-fn method_color(method: &HttpMethod) -> Color {
+fn method_color(method: HttpMethod) -> Color {
     match method {
         HttpMethod::Get | HttpMethod::Head => Color::Green,
         HttpMethod::Post => Color::Yellow,
@@ -159,7 +160,8 @@ fn render_history_search(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
-    let para = Paragraph::new(app.history_search.content()).block(block);
+    let search_text = app.history_search.text();
+    let para = Paragraph::new(search_text.as_ref()).block(block);
     frame.render_widget(para, area);
 
     if focused {
@@ -197,12 +199,12 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
             current_label = Some(label);
         }
 
-        let color = method_color(&entry.method);
+        let color = method_color(entry.method);
         let method_span = Span::styled(
             format!("{:<7}", entry.method.as_str()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         );
-        let url_span = Span::raw(entry.url.clone());
+        let url_span = Span::raw(entry.url.as_str());
         items.push(ListItem::new(Line::from(vec![method_span, url_span])));
         visual_map.push(Some(*idx));
     }
@@ -281,23 +283,26 @@ fn render_saved_requests(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Builds a list item for a saved request.
-fn saved_request_list_item(request: &SavedRequest) -> ListItem<'static> {
+fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
     let method_span = Span::styled(
         format!("{:<7}", request.method.as_str()),
         Style::default()
-            .fg(method_color(&request.method))
+            .fg(method_color(request.method))
             .add_modifier(Modifier::BOLD),
     );
     let name_span = Span::styled(
-        request.name.clone(),
+        request.name.as_str(),
         Style::default().add_modifier(Modifier::BOLD),
     );
-    let url_span = Span::styled(
-        format!("  {}", request.url),
-        Style::default().fg(Color::DarkGray),
-    );
+    let url_span = Span::styled(request.url.as_str(), Style::default().fg(Color::DarkGray));
 
-    ListItem::new(Line::from(vec![method_span, name_span, url_span]))
+    ListItem::new(Line::from(vec![
+        method_span,
+        Span::raw(" "),
+        name_span,
+        Span::raw("  "),
+        url_span,
+    ]))
 }
 
 // ── Composer ─────────────────────────────────────────────────────────────────
@@ -341,7 +346,7 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
     let method_para = Paragraph::new(Span::styled(
         method.as_str(),
         Style::default()
-            .fg(method_color(method))
+            .fg(method_color(*method))
             .add_modifier(Modifier::BOLD),
     ))
     .block(method_block);
@@ -355,7 +360,8 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(url_focused));
 
-    let url_para = Paragraph::new(app.url.content()).block(url_block);
+    let url_text = app.url.text();
+    let url_para = Paragraph::new(url_text.as_ref()).block(url_block);
     frame.render_widget(url_para, url_area);
 
     if url_focused {
@@ -375,7 +381,8 @@ fn render_headers(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
-    let para = Paragraph::new(app.headers.content())
+    let headers_text = app.headers.text();
+    let para = Paragraph::new(headers_text.as_ref())
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
@@ -397,7 +404,8 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
-    let para = Paragraph::new(app.body.content())
+    let body_text = app.body.text();
+    let para = Paragraph::new(body_text.as_ref())
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
@@ -570,7 +578,7 @@ fn response_bucket_color(bucket_idx: usize) -> Color {
 }
 
 /// Builds response body tab text.
-fn render_response_body_text(resp: &HttpResponse) -> Text<'static> {
+fn render_response_body_text(resp: &HttpResponse) -> Text<'_> {
     let mut lines: Vec<Line> = Vec::new();
     let sc = status_color(resp.status_code);
 
@@ -583,13 +591,22 @@ fn render_response_body_text(resp: &HttpResponse) -> Text<'static> {
     for (k, v) in &resp.headers {
         lines.push(Line::from(vec![
             Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
-            Span::raw(v.clone()),
+            Span::raw(v.as_str()),
         ]));
     }
     lines.push(Line::raw(""));
 
-    for line in format_response_body(&resp.body).lines() {
-        lines.push(Line::raw(line.to_string()));
+    match format_response_body(&resp.body) {
+        Cow::Borrowed(body) => {
+            for line in body.lines() {
+                lines.push(Line::raw(line));
+            }
+        }
+        Cow::Owned(body) => {
+            for line in body.lines() {
+                lines.push(Line::raw(line.to_string()));
+            }
+        }
     }
 
     Text::from(lines)
@@ -650,15 +667,15 @@ fn body_bytes(body: Option<&str>) -> usize {
 }
 
 /// Formats response body text for display when a structured format is detected.
-fn format_response_body(body: &str) -> String {
+fn format_response_body(body: &str) -> Cow<'_, str> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return String::new();
+        return Cow::Borrowed("");
     }
 
     serde_json::from_str::<serde_json::Value>(trimmed)
         .and_then(|value| serde_json::to_string_pretty(&value))
-        .unwrap_or_else(|_| body.to_string())
+        .map_or_else(|_| Cow::Borrowed(body), Cow::Owned)
 }
 
 // ── Status bar ───────────────────────────────────────────────────────────────

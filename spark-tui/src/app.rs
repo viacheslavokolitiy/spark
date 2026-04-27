@@ -43,7 +43,7 @@ pub enum ResponseTab {
 }
 
 /// Active collection shown in the sidebar.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarMode {
     /// Show request history.
     History,
@@ -52,7 +52,7 @@ pub enum SidebarMode {
 }
 
 /// Which text area a generic key handler should target.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextAreaTarget {
     /// Headers editor.
     Headers,
@@ -199,7 +199,7 @@ impl App {
     /// Returns indexes of history entries matching the active search query.
     #[must_use]
     pub fn filtered_history_indices(&self) -> Vec<usize> {
-        let query = self.history_search.content();
+        let query = self.history_search.text();
         let query = query.trim();
 
         self.history
@@ -212,7 +212,7 @@ impl App {
     /// Returns indexes of saved requests matching the active search query.
     #[must_use]
     pub fn filtered_saved_indices(&self) -> Vec<usize> {
-        let query = self.history_search.content();
+        let query = self.history_search.text();
         let query = query.trim();
 
         self.saved_requests
@@ -431,7 +431,8 @@ impl App {
             return;
         };
 
-        if !history_matches(entry, self.history_search.content().trim()) {
+        let query = self.history_search.text();
+        if !history_matches(entry, query.trim()) {
             return;
         }
 
@@ -441,12 +442,7 @@ impl App {
 
         self.url.set_content(&entry.url);
 
-        let headers_text = entry
-            .headers
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let headers_text = format_headers(&entry.headers);
         self.headers.set_content(&headers_text);
 
         self.body.set_content(entry.body.as_deref().unwrap_or(""));
@@ -465,7 +461,8 @@ impl App {
             return;
         };
 
-        if !saved_request_matches(request, self.history_search.content().trim()) {
+        let query = self.history_search.text();
+        if !saved_request_matches(request, query.trim()) {
             return;
         }
 
@@ -475,12 +472,7 @@ impl App {
 
         self.url.set_content(&request.url);
 
-        let headers_text = request
-            .headers
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let headers_text = format_headers(&request.headers);
         self.headers.set_content(&headers_text);
 
         self.body.set_content(request.body.as_deref().unwrap_or(""));
@@ -497,7 +489,6 @@ impl App {
         };
 
         let saved = SavedRequest::from_request(&request);
-        let name = saved.name.clone();
         match upsert_saved_request(
             &self.config.saved_requests_file,
             &mut self.saved_requests,
@@ -506,6 +497,7 @@ impl App {
             Ok(idx) => {
                 self.saved_index = idx;
                 self.sidebar_mode = SidebarMode::Saved;
+                let name = &self.saved_requests[idx].name;
                 self.status_message = format!("Saved request: {name}");
             }
             Err(e) => {
@@ -576,23 +568,25 @@ impl App {
 
     /// Builds a request from the current composer fields.
     fn current_composed_request(&self) -> Option<HttpRequest> {
-        let url = self.url.content().trim().to_string();
+        let url_text = self.url.text();
+        let url = url_text.trim();
         if url.is_empty() {
             return None;
         }
 
-        let method = self.current_method().clone();
-        let headers = parse_headers(&self.headers.content());
-        let body_text = self.body.content();
+        let method = *self.current_method();
+        let headers_text = self.headers.text();
+        let headers = parse_headers(headers_text.as_ref());
+        let body_text = self.body.text();
         let body = if body_text.trim().is_empty() {
             None
         } else {
-            Some(body_text)
+            Some(body_text.into_owned())
         };
 
         Some(HttpRequest {
             method,
-            url,
+            url: url.to_string(),
             headers,
             body,
         })
@@ -723,44 +717,82 @@ fn parse_headers(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Formats header pairs as one `Key: Value` line per header.
+fn format_headers(headers: &[(String, String)]) -> String {
+    let capacity = headers
+        .iter()
+        .map(|(key, value)| key.len() + ": ".len() + value.len() + "\n".len())
+        .sum::<usize>()
+        .saturating_sub(usize::from(!headers.is_empty()));
+    let mut text = String::with_capacity(capacity);
+
+    for (idx, (key, value)) in headers.iter().enumerate() {
+        if idx > 0 {
+            text.push('\n');
+        }
+        text.push_str(key);
+        text.push_str(": ");
+        text.push_str(value);
+    }
+
+    text
+}
+
 /// Returns whether a history entry matches the search query.
 fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
+    let query = query.trim();
     if query.is_empty() {
         return true;
     }
 
-    entry.method.as_str().to_lowercase().contains(&query)
-        || entry.url.to_lowercase().contains(&query)
-        || check_headers(&entry.headers, query.as_str())
+    contains_case_insensitive(entry.method.as_str(), query)
+        || contains_case_insensitive(&entry.url, query)
+        || check_headers(&entry.headers, query)
         || entry
             .body
             .as_deref()
-            .is_some_and(|body| body.to_lowercase().contains(&query))
+            .is_some_and(|body| contains_case_insensitive(body, query))
 }
 
-/// Checks entry or request headers
+/// Checks entry or request headers.
 fn check_headers(headers: &[(String, String)], query: &str) -> bool {
     headers.iter().any(|(key, value)| {
-        key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+        contains_case_insensitive(key, query) || contains_case_insensitive(value, query)
     })
 }
 
 /// Returns whether a saved request matches the search query.
 fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
+    let query = query.trim();
     if query.is_empty() {
         return true;
     }
 
-    request.name.to_lowercase().contains(&query)
-        || request.method.as_str().to_lowercase().contains(&query)
-        || request.url.to_lowercase().contains(&query)
-        || check_headers(&request.headers, query.as_str())
+    contains_case_insensitive(&request.name, query)
+        || contains_case_insensitive(request.method.as_str(), query)
+        || contains_case_insensitive(&request.url, query)
+        || check_headers(&request.headers, query)
         || request
             .body
             .as_deref()
-            .is_some_and(|body| body.to_lowercase().contains(&query))
+            .is_some_and(|body| contains_case_insensitive(body, query))
+}
+
+/// Returns whether `haystack` contains `needle` without regard to case.
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+
+    if haystack.is_ascii() && needle.is_ascii() {
+        let needle = needle.as_bytes();
+        return haystack
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle));
+    }
+
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 #[cfg(test)]

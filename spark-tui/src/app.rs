@@ -90,6 +90,8 @@ pub struct App {
     pub response: Option<HttpResponse>,
     /// Request that produced the most recent response.
     pub last_request: Option<HttpRequest>,
+    /// Request waiting for a painted "sending" frame before execution.
+    pending_request: Option<HttpRequest>,
     /// Active tab in the response pane.
     pub response_tab: ResponseTab,
     /// Vertical scroll offset for the response viewer.
@@ -122,6 +124,7 @@ impl App {
             sidebar_mode: SidebarMode::History,
             response: None,
             last_request: None,
+            pending_request: None,
             response_tab: ResponseTab::Body,
             response_scroll: 0,
             should_quit: false,
@@ -146,6 +149,11 @@ impl App {
                 && let Event::Key(key) = event::read()?
             {
                 self.handle_key(key);
+            }
+
+            if self.pending_request.is_some() {
+                terminal.draw(|f| crate::ui::render(f, self))?;
+                self.execute_pending_request();
             }
 
             if self.should_quit {
@@ -194,6 +202,12 @@ impl App {
     /// Returns the currently selected [`HttpMethod`].
     pub fn current_method(&self) -> &HttpMethod {
         &HttpMethod::all()[self.method_index]
+    }
+
+    /// Returns whether a request is queued or currently being started.
+    #[must_use]
+    pub fn is_sending(&self) -> bool {
+        self.pending_request.is_some()
     }
 
     /// Returns indexes of history entries matching the active search query.
@@ -535,14 +549,24 @@ impl App {
         }
     }
 
-    /// Builds and executes the current request, writing the result to history.
+    /// Queues the current request for execution after the sending state is rendered.
     pub fn send_request(&mut self) {
         let Some(request) = self.current_composed_request() else {
             self.status_message = "URL is empty — enter a URL and try again.".to_string();
             return;
         };
+        self.focus = Focus::Response;
+        self.response_tab = ResponseTab::Body;
+        self.response_scroll = 0;
         self.status_message = format!("Sending {} {}…", request.method, request.url);
+        self.pending_request = Some(request);
+    }
 
+    /// Executes a queued request, writing the result to history.
+    fn execute_pending_request(&mut self) {
+        let Some(request) = self.pending_request.take() else {
+            return;
+        };
         match request.execute() {
             Ok(response) => {
                 let entry = HistoryEntry::from_response(&request, response.status_code);
@@ -556,9 +580,6 @@ impl App {
                 self.select_latest_visible_sidebar_item();
                 self.last_request = Some(request);
                 self.response = Some(response);
-                self.response_tab = ResponseTab::Body;
-                self.response_scroll = 0;
-                self.focus = Focus::Response;
             }
             Err(e) => {
                 self.status_message = format!("Error: {e}");

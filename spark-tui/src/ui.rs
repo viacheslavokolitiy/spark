@@ -425,14 +425,18 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
 fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Response;
 
-    let title = match &app.response {
-        Some(r) => format!(
-            " Response  {} {}  {} ",
-            r.status_code,
-            r.status_text,
-            format_duration(r.duration_ms),
-        ),
-        None => " Response ".to_string(),
+    let title = if app.is_sending() {
+        " Response  Sending... ".to_string()
+    } else {
+        match &app.response {
+            Some(r) => format!(
+                " Response  {} {}  {} ",
+                r.status_code,
+                r.status_text,
+                format_duration(r.duration_ms),
+            ),
+            None => " Response ".to_string(),
+        }
     };
 
     let block = Block::default()
@@ -469,6 +473,7 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let content: Text = match (&app.response, &app.response_tab) {
+        (None, _) if app.is_sending() => Text::raw("Sending request..."),
         (None, _) => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
         (Some(resp), ResponseTab::Sizes) => {

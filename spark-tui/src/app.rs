@@ -7,6 +7,7 @@ use spark_core::{
     config::Config,
     history::{HistoryEntry, append_history, load_history},
     http::{HttpMethod, HttpRequest, HttpResponse},
+    saved::{SavedRequest, load_saved_requests, remove_saved_request, upsert_saved_request},
 };
 
 use crate::input::TextInput;
@@ -31,7 +32,7 @@ pub enum Focus {
 }
 
 /// Selected tab in the response pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ResponseTab {
     /// Shows status, headers, and body content.
     Body,
@@ -41,7 +42,17 @@ pub enum ResponseTab {
     History,
 }
 
+/// Active collection shown in the sidebar.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SidebarMode {
+    /// Show request history.
+    History,
+    /// Show saved reusable requests.
+    Saved,
+}
+
 /// Which text area a generic key handler should target.
+#[derive(Debug, PartialEq, Eq)]
 enum TextAreaTarget {
     /// Headers editor.
     Headers,
@@ -69,6 +80,12 @@ pub struct App {
     pub history: Vec<HistoryEntry>,
     /// Currently selected row in the history list.
     pub history_index: usize,
+    /// Saved reusable requests.
+    pub saved_requests: Vec<SavedRequest>,
+    /// Currently selected row in the saved request list.
+    pub saved_index: usize,
+    /// Active sidebar collection.
+    pub sidebar_mode: SidebarMode,
     /// Most recent HTTP response.
     pub response: Option<HttpResponse>,
     /// Request that produced the most recent response.
@@ -88,6 +105,8 @@ impl App {
     pub fn new(config: Config) -> Self {
         let history = load_history(&config.history_file);
         let history_index = history.len().saturating_sub(1);
+        let saved_requests = load_saved_requests(&config.saved_requests_file);
+        let saved_index = saved_requests.len().saturating_sub(1);
         Self {
             config,
             focus: Focus::Url,
@@ -98,13 +117,16 @@ impl App {
             history_search: TextInput::single_line(),
             history,
             history_index,
+            saved_requests,
+            saved_index,
+            sidebar_mode: SidebarMode::History,
             response: None,
             last_request: None,
             response_tab: ResponseTab::Body,
             response_scroll: 0,
             should_quit: false,
             status_message: String::from(
-                "Tab: cycle focus | Ctrl+S / Enter in URL: send | q: quit",
+                "Tab: cycle focus | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history",
             ),
         }
     }
@@ -135,7 +157,7 @@ impl App {
 
     /// Dispatches a key event to the appropriate handler.
     pub fn handle_key(&mut self, key: KeyEvent) {
-        // Global shortcuts (Ctrl+C / Ctrl+S) regardless of focus.
+        // Global shortcuts regardless of focus.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
@@ -144,6 +166,14 @@ impl App {
                 }
                 KeyCode::Char('s') => {
                     self.send_request();
+                    return;
+                }
+                KeyCode::Char('p') => {
+                    self.save_current_request();
+                    return;
+                }
+                KeyCode::Char('o') => {
+                    self.toggle_sidebar_mode();
                     return;
                 }
                 _ => {}
@@ -176,6 +206,19 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(idx, entry)| history_matches(entry, query).then_some(idx))
+            .collect()
+    }
+
+    /// Returns indexes of saved requests matching the active search query.
+    #[must_use]
+    pub fn filtered_saved_indices(&self) -> Vec<usize> {
+        let query = self.history_search.content();
+        let query = query.trim();
+
+        self.saved_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, request)| saved_request_matches(request, query).then_some(idx))
             .collect()
     }
 
@@ -214,12 +257,16 @@ impl App {
             KeyCode::Tab => self.next_focus(),
             KeyCode::BackTab => self.prev_focus(),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.select_next_visible_history();
+                self.select_next_visible_sidebar_item();
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.select_previous_visible_history();
+                self.select_previous_visible_sidebar_item();
             }
-            KeyCode::Enter => self.load_from_history(),
+            KeyCode::Left | KeyCode::Char('h' | 'l') | KeyCode::Right => {
+                self.toggle_sidebar_mode();
+            }
+            KeyCode::Enter => self.load_from_sidebar(),
+            KeyCode::Delete | KeyCode::Backspace => self.remove_selected_saved_request(),
             KeyCode::Char('q') => self.should_quit = true,
             _ => {}
         }
@@ -240,11 +287,11 @@ impl App {
             KeyCode::End => self.history_search.move_to_line_end(),
             KeyCode::Backspace => {
                 self.history_search.backspace();
-                self.select_latest_visible_history();
+                self.select_latest_visible_sidebar_item();
             }
             KeyCode::Char(c) => {
                 self.history_search.insert_char(c);
-                self.select_latest_visible_history();
+                self.select_latest_visible_sidebar_item();
             }
             _ => {}
         }
@@ -354,6 +401,23 @@ impl App {
 
     // ── Actions ──────────────────────────────────────────────────────────────
 
+    /// Toggles the sidebar between history and saved requests.
+    fn toggle_sidebar_mode(&mut self) {
+        self.sidebar_mode = match self.sidebar_mode {
+            SidebarMode::History => SidebarMode::Saved,
+            SidebarMode::Saved => SidebarMode::History,
+        };
+        self.select_latest_visible_sidebar_item();
+    }
+
+    /// Loads the selected sidebar item into the request composer.
+    fn load_from_sidebar(&mut self) {
+        match self.sidebar_mode {
+            SidebarMode::History => self.load_from_history(),
+            SidebarMode::Saved => self.load_from_saved_request(),
+        }
+    }
+
     /// Loads the selected history entry into the request composer.
     fn load_from_history(&mut self) {
         if !self
@@ -391,28 +455,99 @@ impl App {
         self.status_message = format!("Loaded: {} {}", entry.method, entry.url);
     }
 
-    /// Builds and executes the current request, writing the result to history.
-    pub fn send_request(&mut self) {
-        let url = self.url.content().trim().to_string();
-        if url.is_empty() {
-            self.status_message = "URL is empty — enter a URL and try again.".to_string();
+    /// Loads the selected saved request into the request composer.
+    fn load_from_saved_request(&mut self) {
+        if !self.filtered_saved_indices().contains(&self.saved_index) {
+            self.select_latest_visible_saved_request();
+        }
+
+        let Some(request) = self.saved_requests.get(self.saved_index) else {
+            return;
+        };
+
+        if !saved_request_matches(request, self.history_search.content().trim()) {
             return;
         }
 
-        let method = self.current_method().clone();
-        let headers = parse_headers(&self.headers.content());
-        let body_text = self.body.content();
-        let body = if body_text.trim().is_empty() {
-            None
-        } else {
-            Some(body_text)
+        if let Some(idx) = HttpMethod::all().iter().position(|m| *m == request.method) {
+            self.method_index = idx;
+        }
+
+        self.url.set_content(&request.url);
+
+        let headers_text = request
+            .headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.headers.set_content(&headers_text);
+
+        self.body.set_content(request.body.as_deref().unwrap_or(""));
+
+        self.focus = Focus::Url;
+        self.status_message = format!("Loaded saved: {}", request.name);
+    }
+
+    /// Saves the current composer contents as a reusable saved request.
+    fn save_current_request(&mut self) {
+        let Some(request) = self.current_composed_request() else {
+            self.status_message = "URL is empty - enter a URL before saving.".to_string();
+            return;
         };
 
-        let request = HttpRequest {
-            method,
-            url,
-            headers,
-            body,
+        let saved = SavedRequest::from_request(&request);
+        let name = saved.name.clone();
+        match upsert_saved_request(
+            &self.config.saved_requests_file,
+            &mut self.saved_requests,
+            saved,
+        ) {
+            Ok(idx) => {
+                self.saved_index = idx;
+                self.sidebar_mode = SidebarMode::Saved;
+                self.status_message = format!("Saved request: {name}");
+            }
+            Err(e) => {
+                self.status_message = format!("Error saving request: {e}");
+            }
+        }
+    }
+
+    /// Removes the selected saved request when the saved sidebar is active.
+    fn remove_selected_saved_request(&mut self) {
+        if self.sidebar_mode != SidebarMode::Saved {
+            return;
+        }
+
+        if !self.filtered_saved_indices().contains(&self.saved_index) {
+            self.select_latest_visible_saved_request();
+        }
+
+        match remove_saved_request(
+            &self.config.saved_requests_file,
+            &mut self.saved_requests,
+            self.saved_index,
+        ) {
+            Ok(Some(removed)) => {
+                self.saved_index = self
+                    .saved_index
+                    .min(self.saved_requests.len().saturating_sub(1));
+                self.select_latest_visible_saved_request();
+                self.status_message = format!("Removed saved request: {}", removed.name);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.status_message = format!("Error removing saved request: {e}");
+            }
+        }
+    }
+
+    /// Builds and executes the current request, writing the result to history.
+    pub fn send_request(&mut self) {
+        let Some(request) = self.current_composed_request() else {
+            self.status_message = "URL is empty — enter a URL and try again.".to_string();
+            return;
         };
         self.status_message = format!("Sending {} {}…", request.method, request.url);
 
@@ -426,7 +561,7 @@ impl App {
                 );
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
-                self.select_latest_visible_history();
+                self.select_latest_visible_sidebar_item();
                 self.last_request = Some(request);
                 self.response = Some(response);
                 self.response_tab = ResponseTab::Body;
@@ -436,6 +571,46 @@ impl App {
             Err(e) => {
                 self.status_message = format!("Error: {e}");
             }
+        }
+    }
+
+    /// Builds a request from the current composer fields.
+    fn current_composed_request(&self) -> Option<HttpRequest> {
+        let url = self.url.content().trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
+
+        let method = self.current_method().clone();
+        let headers = parse_headers(&self.headers.content());
+        let body_text = self.body.content();
+        let body = if body_text.trim().is_empty() {
+            None
+        } else {
+            Some(body_text)
+        };
+
+        Some(HttpRequest {
+            method,
+            url,
+            headers,
+            body,
+        })
+    }
+
+    /// Selects the next entry in the currently visible sidebar list.
+    fn select_next_visible_sidebar_item(&mut self) {
+        match self.sidebar_mode {
+            SidebarMode::History => self.select_next_visible_history(),
+            SidebarMode::Saved => self.select_next_visible_saved_request(),
+        }
+    }
+
+    /// Selects the previous entry in the currently visible sidebar list.
+    fn select_previous_visible_sidebar_item(&mut self) {
+        match self.sidebar_mode {
+            SidebarMode::History => self.select_previous_visible_history(),
+            SidebarMode::Saved => self.select_previous_visible_saved_request(),
         }
     }
 
@@ -469,6 +644,47 @@ impl App {
     fn select_latest_visible_history(&mut self) {
         if let Some(idx) = self.filtered_history_indices().last() {
             self.history_index = *idx;
+        }
+    }
+
+    /// Selects the next entry in the currently visible saved request list.
+    fn select_next_visible_saved_request(&mut self) {
+        let visible = self.filtered_saved_indices();
+        let Some(current_pos) = visible.iter().position(|idx| *idx == self.saved_index) else {
+            self.select_latest_visible_saved_request();
+            return;
+        };
+
+        if let Some(next_idx) = visible.get(current_pos + 1) {
+            self.saved_index = *next_idx;
+        }
+    }
+
+    /// Selects the previous entry in the currently visible saved request list.
+    fn select_previous_visible_saved_request(&mut self) {
+        let visible = self.filtered_saved_indices();
+        let Some(current_pos) = visible.iter().position(|idx| *idx == self.saved_index) else {
+            self.select_latest_visible_saved_request();
+            return;
+        };
+
+        if current_pos > 0 {
+            self.saved_index = visible[current_pos - 1];
+        }
+    }
+
+    /// Selects the newest saved request currently visible after filtering.
+    fn select_latest_visible_saved_request(&mut self) {
+        if let Some(idx) = self.filtered_saved_indices().last() {
+            self.saved_index = *idx;
+        }
+    }
+
+    /// Selects the newest item currently visible after filtering.
+    fn select_latest_visible_sidebar_item(&mut self) {
+        match self.sidebar_mode {
+            SidebarMode::History => self.select_latest_visible_history(),
+            SidebarMode::Saved => self.select_latest_visible_saved_request(),
         }
     }
 
@@ -516,10 +732,32 @@ fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
 
     entry.method.as_str().to_lowercase().contains(&query)
         || entry.url.to_lowercase().contains(&query)
-        || entry.headers.iter().any(|(key, value)| {
-            key.to_lowercase().contains(&query) || value.to_lowercase().contains(&query)
-        })
+        || check_headers(&entry.headers, query.as_str())
         || entry
+            .body
+            .as_deref()
+            .is_some_and(|body| body.to_lowercase().contains(&query))
+}
+
+/// Checks entry or request headers
+fn check_headers(headers: &[(String, String)], query: &str) -> bool {
+    headers.iter().any(|(key, value)| {
+        key.to_lowercase().contains(query) || value.to_lowercase().contains(query)
+    })
+}
+
+/// Returns whether a saved request matches the search query.
+fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+
+    request.name.to_lowercase().contains(&query)
+        || request.method.as_str().to_lowercase().contains(&query)
+        || request.url.to_lowercase().contains(&query)
+        || check_headers(&request.headers, query.as_str())
+        || request
             .body
             .as_deref()
             .is_some_and(|body| body.to_lowercase().contains(&query))
@@ -533,16 +771,35 @@ mod tests {
 
     use super::*;
 
+    /// Creates a mostly unique suffix for test files.
+    fn test_id() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time should be after Unix epoch")
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    }
+
     /// Creates an app with deterministic in-memory history.
     fn app_with_history(history: Vec<HistoryEntry>) -> App {
+        let test_id = test_id();
         let mut app = App::new(Config {
-            history_file: std::env::temp_dir().join(format!(
-                "spark-tui-test-history-{}.jsonl",
-                std::process::id()
-            )),
+            history_file: std::env::temp_dir()
+                .join(format!("spark-tui-test-history-{test_id}.jsonl")),
+            saved_requests_file: std::env::temp_dir()
+                .join(format!("spark-tui-test-saved-{test_id}.json")),
         });
         app.history = history;
         app.history_index = app.history.len().saturating_sub(1);
+        app
+    }
+
+    /// Creates an app with deterministic in-memory saved requests.
+    fn app_with_saved_requests(saved_requests: Vec<SavedRequest>) -> App {
+        let mut app = app_with_history(Vec::new());
+        app.saved_requests = saved_requests;
+        app.saved_index = app.saved_requests.len().saturating_sub(1);
+        app.sidebar_mode = SidebarMode::Saved;
         app
     }
 
@@ -559,6 +816,24 @@ mod tests {
             headers,
             body: body.map(ToString::to_string),
         })
+    }
+
+    /// Creates a saved request for tests.
+    fn saved_request(
+        name: &str,
+        method: HttpMethod,
+        url: &str,
+        body: Option<&str>,
+    ) -> SavedRequest {
+        let request = HttpRequest {
+            method,
+            url: url.to_string(),
+            headers: Vec::new(),
+            body: body.map(ToString::to_string),
+        };
+        let mut saved = SavedRequest::from_request(&request);
+        saved.name = name.to_string();
+        saved
     }
 
     /// Builds a plain key event for input handler tests.
@@ -684,5 +959,64 @@ mod tests {
         app.handle_history_key(key(KeyCode::Down));
 
         assert_eq!(app.history_index, 2);
+    }
+
+    /// Saved request search matches names and request parts.
+    #[test]
+    fn saved_search_matches_name_and_request_parts() {
+        let mut app = app_with_saved_requests(vec![
+            saved_request(
+                "List users",
+                HttpMethod::Get,
+                "https://example.com/users",
+                None,
+            ),
+            saved_request(
+                "Create order",
+                HttpMethod::Post,
+                "https://example.com/orders",
+                Some("{\"status\":\"pending\"}"),
+            ),
+        ]);
+
+        app.history_search.set_content("list");
+        assert_eq!(app.filtered_saved_indices(), vec![0]);
+
+        app.history_search.set_content("POST");
+        assert_eq!(app.filtered_saved_indices(), vec![1]);
+
+        app.history_search.set_content("pending");
+        assert_eq!(app.filtered_saved_indices(), vec![1]);
+    }
+
+    /// Saving the current composer pins a reusable request and selects saved mode.
+    #[test]
+    fn save_current_request_adds_saved_request() {
+        let mut app = app_with_history(Vec::new());
+        app.url.set_content("https://example.com/users");
+
+        app.save_current_request();
+
+        assert_eq!(app.sidebar_mode, SidebarMode::Saved);
+        assert_eq!(app.saved_requests.len(), 1);
+        assert_eq!(app.saved_requests[0].name, "GET https://example.com/users");
+        let _ = std::fs::remove_file(&app.config.saved_requests_file);
+    }
+
+    /// Loading a saved request copies it into the request composer.
+    #[test]
+    fn load_saved_request_populates_composer() {
+        let mut app = app_with_saved_requests(vec![saved_request(
+            "Create order",
+            HttpMethod::Post,
+            "https://example.com/orders",
+            Some("{\"status\":\"pending\"}"),
+        )]);
+
+        app.load_from_saved_request();
+
+        assert_eq!(app.current_method(), &HttpMethod::Post);
+        assert_eq!(app.url.content(), "https://example.com/orders");
+        assert_eq!(app.body.content(), "{\"status\":\"pending\"}");
     }
 }

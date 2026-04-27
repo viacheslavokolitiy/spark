@@ -3,11 +3,25 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// Returns the default history file path.
+fn default_history_file() -> PathBuf {
+    PathBuf::from("history.jsonl")
+}
+
+/// Returns the default saved requests file path.
+fn default_saved_requests_file() -> PathBuf {
+    PathBuf::from("saved_requests.json")
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Path to the JSONL file where request history is persisted.
+    #[serde(default = "default_history_file", alias = "history")]
     pub history_file: PathBuf,
+    /// Path to the JSON file where saved requests are persisted.
+    #[serde(default = "default_saved_requests_file")]
+    pub saved_requests_file: PathBuf,
 }
 
 impl Config {
@@ -25,7 +39,8 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            history_file: PathBuf::from("history.jsonl"),
+            history_file: default_history_file(),
+            saved_requests_file: default_saved_requests_file(),
         }
     }
 }

@@ -9,11 +9,12 @@ use ratatui::{
 };
 use spark_core::history::{HistoryEntry, relative_time_label};
 use spark_core::http::{HttpMethod, HttpRequest, HttpResponse};
+use spark_core::saved::SavedRequest;
 use tui_piechart::{
     LegendAlignment, LegendLayout, LegendPosition, PieChart, PieSlice, Resolution, symbols,
 };
 
-use crate::app::{App, Focus, ResponseTab};
+use crate::app::{App, Focus, ResponseTab, SidebarMode};
 
 /// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
@@ -116,11 +117,38 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
         .split(area);
 
-    render_history_search(frame, app, rows[0]);
-    render_history(frame, app, rows[1]);
+    render_sidebar_tabs(frame, app, rows[0]);
+    render_history_search(frame, app, rows[1]);
+    match app.sidebar_mode {
+        SidebarMode::History => render_history(frame, app, rows[2]),
+        SidebarMode::Saved => render_saved_requests(frame, app, rows[2]),
+    }
+}
+
+/// Renders the sidebar mode selector.
+fn render_sidebar_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let selected_tab = match app.sidebar_mode {
+        SidebarMode::History => 0,
+        SidebarMode::Saved => 1,
+    };
+
+    let tabs = Tabs::new(["History", "Saved"])
+        .select(selected_tab)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(tabs, area);
 }
 
 /// Renders the request history search input.
@@ -197,7 +225,7 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(" History ")
+        .title(" History  (Ctrl+O: saved) ")
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
@@ -211,6 +239,65 @@ fn render_history(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Renders the filtered saved request list.
+fn render_saved_requests(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::History;
+    let filtered_indices = app.filtered_saved_indices();
+    let mut items: Vec<ListItem> = Vec::new();
+
+    for idx in &filtered_indices {
+        let request = &app.saved_requests[*idx];
+        items.push(saved_request_list_item(request));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  No saved requests",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+
+    let visual_selected = filtered_indices
+        .iter()
+        .position(|idx| *idx == app.saved_index);
+
+    let block = Block::default()
+        .title(" Saved  (Ctrl+O: history | Enter: load | Del: remove) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let mut list_state = ListState::default();
+    list_state.select(visual_selected);
+
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Builds a list item for a saved request.
+fn saved_request_list_item(request: &SavedRequest) -> ListItem<'static> {
+    let method_span = Span::styled(
+        format!("{:<7}", request.method.as_str()),
+        Style::default()
+            .fg(method_color(&request.method))
+            .add_modifier(Modifier::BOLD),
+    );
+    let name_span = Span::styled(
+        request.name.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    let url_span = Span::styled(
+        format!("  {}", request.url),
+        Style::default().fg(Color::DarkGray),
+    );
+
+    ListItem::new(Line::from(vec![method_span, name_span, url_span]))
 }
 
 // ── Composer ─────────────────────────────────────────────────────────────────
@@ -264,7 +351,7 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
     // URL input
     let url_focused = app.focus == Focus::Url;
     let url_block = Block::default()
-        .title(" URL  (←/→ method • Enter / Ctrl+S: send) ")
+        .title(" URL  (Enter / Ctrl+S: send | Ctrl+P: save) ")
         .borders(Borders::ALL)
         .border_style(border_style(url_focused));
 
@@ -373,7 +460,7 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let content: Text = match (&app.response, app.response_tab) {
+    let content: Text = match (&app.response, &app.response_tab) {
         (None, _) => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
         (Some(resp), ResponseTab::Sizes) => {

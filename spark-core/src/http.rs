@@ -9,7 +9,7 @@ const CRLF_SEP: &str = "\r\n\r\n";
 const LF_SEP: &str = "\n\n";
 
 /// Supported HTTP methods.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HttpMethod {
     /// HTTP GET.
     Get,

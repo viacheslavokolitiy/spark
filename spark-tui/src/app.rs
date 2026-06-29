@@ -118,6 +118,8 @@ pub struct App {
     pub focus: Focus,
     /// Index into [`HttpMethod::all()`] for the selected method.
     pub method_index: usize,
+    /// Whether the request method dropdown is expanded.
+    pub method_dropdown_open: bool,
     /// URL input.
     pub url: TextInput,
     /// Headers input (one `Key: Value` per line).
@@ -161,8 +163,9 @@ impl App {
         let saved_index = saved_requests.len().saturating_sub(1);
         Self {
             config,
-            focus: Focus::Url,
+            focus: Focus::History,
             method_index: 0,
+            method_dropdown_open: false,
             url: TextInput::single_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
@@ -289,6 +292,7 @@ impl App {
     // ── Focus cycling ────────────────────────────────────────────────────────
     /// Moves focus to the next pane in tab order.
     fn next_focus(&mut self) {
+        self.method_dropdown_open = false;
         self.focus = match self.focus {
             Focus::History => Focus::Search,
             Focus::Search => Focus::Method,
@@ -302,6 +306,7 @@ impl App {
 
     /// Moves focus to the previous pane in tab order.
     fn prev_focus(&mut self) {
+        self.method_dropdown_open = false;
         self.focus = match self.focus {
             Focus::History => Focus::Response,
             Focus::Search => Focus::History,
@@ -363,19 +368,32 @@ impl App {
 
     /// Handles key input while the HTTP method selector is focused.
     fn handle_method_key(&mut self, key: KeyEvent) {
-        let count = HttpMethod::all().len();
         match key.code {
-            KeyCode::Tab => self.next_focus(),
-            KeyCode::BackTab => self.prev_focus(),
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.method_index = if self.method_index == 0 {
-                    count - 1
-                } else {
-                    self.method_index - 1
-                };
+            KeyCode::Tab => {
+                self.method_dropdown_open = false;
+                self.next_focus();
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.method_index = (self.method_index + 1) % count;
+            KeyCode::BackTab => {
+                self.method_dropdown_open = false;
+                self.prev_focus();
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.method_dropdown_open = !self.method_dropdown_open;
+            }
+            KeyCode::Esc => {
+                self.method_dropdown_open = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.method_dropdown_open => {
+                self.select_previous_method();
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.method_dropdown_open => {
+                self.select_next_method();
+            }
+            KeyCode::Left | KeyCode::Char('h') if !self.method_dropdown_open => {
+                self.select_previous_method();
+            }
+            KeyCode::Right | KeyCode::Char('l') if !self.method_dropdown_open => {
+                self.select_next_method();
             }
             KeyCode::Char('q') => self.should_quit = true,
             _ => {}
@@ -511,6 +529,7 @@ impl App {
 
         self.body.set_content(entry.body.as_deref().unwrap_or(""));
 
+        self.method_dropdown_open = false;
         self.focus = Focus::Url;
         self.status_message = format!("Loaded: {} {}", entry.method, entry.url);
     }
@@ -541,6 +560,7 @@ impl App {
 
         self.body.set_content(request.body.as_deref().unwrap_or(""));
 
+        self.method_dropdown_open = false;
         self.focus = Focus::Url;
         self.status_message = format!("Loaded saved: {}", request.name);
     }
@@ -605,6 +625,7 @@ impl App {
             self.status_message = "URL is empty — enter a URL and try again.".to_string();
             return;
         };
+        self.method_dropdown_open = false;
         self.focus = Focus::Response;
         self.response_tab = ResponseTab::Body;
         self.response_scroll = 0;
@@ -751,6 +772,22 @@ impl App {
             SidebarMode::History => self.select_latest_visible_history(),
             SidebarMode::Saved => self.select_latest_visible_saved_request(),
         }
+    }
+
+    /// Selects the previous HTTP method.
+    fn select_previous_method(&mut self) {
+        let count = HttpMethod::all().len();
+        self.method_index = if self.method_index == 0 {
+            count - 1
+        } else {
+            self.method_index - 1
+        };
+    }
+
+    /// Selects the next HTTP method.
+    fn select_next_method(&mut self) {
+        let count = HttpMethod::all().len();
+        self.method_index = (self.method_index + 1) % count;
     }
 
     /// Selects the next response pane tab.
@@ -957,6 +994,28 @@ mod tests {
         assert_eq!(app.filtered_history_indices(), vec![0, 1]);
     }
 
+    /// App startup focuses the history list and selects the latest request.
+    #[test]
+    fn startup_selects_latest_history_request() {
+        let app = app_with_history(vec![
+            history_entry(
+                HttpMethod::Get,
+                "https://example.com/users",
+                Vec::new(),
+                None,
+            ),
+            history_entry(
+                HttpMethod::Post,
+                "https://example.com/orders",
+                Vec::new(),
+                None,
+            ),
+        ]);
+
+        assert_eq!(app.focus, Focus::History);
+        assert_eq!(app.history_index, 1);
+    }
+
     /// Search matches method, URL, headers, and request body.
     #[test]
     fn history_search_matches_request_parts_case_insensitively() {
@@ -1019,6 +1078,48 @@ mod tests {
 
         assert_eq!(app.filtered_history_indices(), vec![0, 2]);
         assert_eq!(app.history_index, 2);
+    }
+
+    /// Enter opens and closes the method dropdown while keeping focus on method.
+    #[test]
+    fn method_dropdown_toggles_with_enter() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::Method;
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.method_dropdown_open);
+        assert_eq!(app.focus, Focus::Method);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.method_dropdown_open);
+        assert_eq!(app.focus, Focus::Method);
+    }
+
+    /// Open method dropdown uses vertical navigation to select a method.
+    #[test]
+    fn method_dropdown_selects_methods_with_arrow_keys() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::Method;
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.current_method(), &HttpMethod::Post);
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.current_method(), &HttpMethod::Get);
+    }
+
+    /// Leaving the method component closes its dropdown.
+    #[test]
+    fn method_dropdown_closes_when_focus_moves() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::Method;
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Tab));
+
+        assert!(!app.method_dropdown_open);
+        assert_eq!(app.focus, Focus::Url);
     }
 
     /// History navigation moves only through visible filtered requests.

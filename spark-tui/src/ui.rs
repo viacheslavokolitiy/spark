@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use spark_core::history::{HistoryEntry, relative_time_label};
 use spark_core::http::{HttpMethod, HttpRequest, HttpResponse};
@@ -33,7 +33,7 @@ fn method_color(method: HttpMethod) -> Color {
     match method {
         HttpMethod::Get | HttpMethod::Head => Color::Green,
         HttpMethod::Post => Color::Yellow,
-        HttpMethod::Put => Color::Blue,
+        HttpMethod::Put => Color::Cyan,
         HttpMethod::Patch => Color::Magenta,
         HttpMethod::Delete => Color::Rgb(255, 140, 0),
         HttpMethod::Options => Color::Rgb(255, 105, 180),
@@ -325,17 +325,18 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    render_method_url(frame, app, rows[0]);
+    let method_area = render_method_url(frame, app, rows[0]);
     render_headers(frame, app, rows[1]);
     render_body(frame, app, rows[2]);
+    render_method_dropdown(frame, app, method_area);
 }
 
 /// Renders the method selector and URL input row.
-fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
-    // Split: [method selector (12 cols)] | [URL input]
+fn render_method_url(frame: &mut Frame, app: &App, area: Rect) -> Rect {
+    // Split: [method selector] | [URL input]
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(12), Constraint::Min(0)])
+        .constraints([Constraint::Length(14), Constraint::Min(0)])
         .split(area);
 
     let method_area = cols[0];
@@ -349,12 +350,16 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(method_focused));
 
-    let method_para = Paragraph::new(Span::styled(
-        method.as_str(),
-        Style::default()
-            .fg(method_color(*method))
-            .add_modifier(Modifier::BOLD),
-    ))
+    let marker = if app.method_dropdown_open { "^" } else { "v" };
+    let method_para = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{:<10}", method.as_str()),
+            Style::default()
+                .fg(method_color(*method))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(marker, Style::default().fg(Color::DarkGray)),
+    ]))
     .block(method_block);
 
     frame.render_widget(method_para, method_area);
@@ -377,6 +382,48 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) {
         let cy = url_area.y + 1;
         frame.set_cursor_position((cx, cy));
     }
+
+    method_area
+}
+
+/// Renders the expanded HTTP method dropdown.
+fn render_method_dropdown(frame: &mut Frame, app: &App, method_area: Rect) {
+    if !app.method_dropdown_open {
+        return;
+    }
+
+    let methods = HttpMethod::all();
+    let dropdown_area = Rect {
+        x: method_area.x,
+        y: method_area.y.saturating_add(method_area.height),
+        width: method_area.width,
+        height: u16::try_from(methods.len() + 2).unwrap_or(u16::MAX),
+    };
+    let items = methods.iter().map(|method| {
+        ListItem::new(Line::from(Span::styled(
+            method.as_str(),
+            Style::default()
+                .fg(method_color(*method))
+                .add_modifier(Modifier::BOLD),
+        )))
+    });
+
+    let block = Block::default()
+        .title(" Select ")
+        .borders(Borders::ALL)
+        .border_style(border_style(app.focus == Focus::Method));
+    let mut state = ListState::default();
+    state.select(Some(app.method_index));
+    let list = List::new(items.collect::<Vec<_>>())
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(Clear, dropdown_area);
+    frame.render_stateful_widget(list, dropdown_area, &mut state);
 }
 
 /// Renders the headers editor.

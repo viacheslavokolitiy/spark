@@ -19,6 +19,12 @@ use crate::app::{App, Focus, ResponseTab, SidebarMode};
 
 /// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
+/// Header name used by servers to set response cookies.
+const SET_COOKIE_HEADER: &str = "set-cookie";
+/// Header name used by servers to describe cache policy.
+const CACHE_CONTROL_HEADER: &str = "cache-control";
+/// Legacy header name used by servers to disable cache.
+const PRAGMA_HEADER: &str = "pragma";
 
 // ── Color helpers ────────────────────────────────────────────────────────────
 
@@ -451,13 +457,13 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(inner);
 
-    let selected_tab = match app.response_tab {
-        ResponseTab::Body => 0,
-        ResponseTab::Sizes => 1,
-        ResponseTab::History => 2,
-    };
+    let selected_tab = ResponseTab::all()
+        .iter()
+        .position(|tab| *tab == app.response_tab)
+        .unwrap_or_default();
+    let tab_titles: Vec<&str> = ResponseTab::all().iter().map(|tab| tab.label()).collect();
 
-    let tabs = Tabs::new(["Body", "Sizes", "History"])
+    let tabs = Tabs::new(tab_titles)
         .select(selected_tab)
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
@@ -476,6 +482,12 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         (None, _) if app.is_sending() => Text::raw("Sending request..."),
         (None, _) => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
+        (Some(resp), ResponseTab::Cookies) => render_response_cookies_text(resp),
+        (Some(resp), ResponseTab::Headers) => render_response_headers_text(resp),
+        (Some(resp), ResponseTab::Scripts) => render_response_scripts_text(resp),
+        (Some(resp), ResponseTab::Trace) => {
+            render_response_trace_text(app.last_request.as_ref(), resp)
+        }
         (Some(resp), ResponseTab::Sizes) => {
             render_response_size_text(app.last_request.as_ref(), resp)
         }
@@ -582,36 +594,172 @@ fn response_bucket_color(bucket_idx: usize) -> Color {
     }
 }
 
-/// Builds response body tab text.
+/// Builds prettified response body tab text.
 fn render_response_body_text(resp: &HttpResponse) -> Text<'_> {
     let mut lines: Vec<Line> = Vec::new();
+
+    match format_response_body(&resp.body) {
+        Cow::Borrowed("") => lines.push(Line::from(Span::styled(
+            "Response body is empty.",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Cow::Borrowed(body) => {
+            push_body_lines(&mut lines, body);
+        }
+        Cow::Owned(body) => {
+            push_body_lines(&mut lines, &body);
+        }
+    }
+
+    Text::from(lines)
+}
+
+/// Adds body lines with stable line numbers.
+fn push_body_lines(lines: &mut Vec<Line<'_>>, body: &str) {
+    for (idx, line) in body.lines().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>4}  ", idx + 1),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(line.to_string()),
+        ]));
+    }
+}
+
+/// Builds response cookies tab text.
+fn render_response_cookies_text(resp: &HttpResponse) -> Text<'static> {
+    let cookies = response_cookies(resp);
+    if cookies.is_empty() {
+        return Text::raw("No Set-Cookie headers in this response.");
+    }
+
+    let mut lines = Vec::new();
+    for (idx, cookie) in cookies.iter().enumerate() {
+        if idx > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            cookie.name.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(metadata_line("Value", &cookie.value));
+        for attr in &cookie.attributes {
+            lines.push(metadata_line("Attribute", attr));
+        }
+    }
+
+    Text::from(lines)
+}
+
+/// Builds response headers tab text.
+fn render_response_headers_text(resp: &HttpResponse) -> Text<'_> {
+    let mut lines = Vec::new();
     let sc = status_color(resp.status_code);
 
     lines.push(Line::from(Span::styled(
         format!("{} {}", resp.status_code, resp.status_text),
         Style::default().fg(sc).add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::raw(""));
 
-    for (k, v) in &resp.headers {
+    if resp.headers.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "No response headers.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return Text::from(lines);
+    }
+
+    lines.push(Line::raw(""));
+    for (key, value) in &resp.headers {
+        let key_style = if is_cache_header(key) {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
         lines.push(Line::from(vec![
-            Span::styled(format!("{k}: "), Style::default().fg(Color::DarkGray)),
-            Span::raw(v.as_str()),
+            Span::styled(format!("{key}: "), key_style),
+            Span::raw(value.as_str()),
         ]));
     }
-    lines.push(Line::raw(""));
 
-    match format_response_body(&resp.body) {
-        Cow::Borrowed(body) => {
-            for line in body.lines() {
-                lines.push(Line::raw(line));
+    Text::from(lines)
+}
+
+/// Builds response scripts tab text.
+fn render_response_scripts_text(resp: &HttpResponse) -> Text<'static> {
+    let scripts = response_scripts(&resp.body);
+    if scripts.is_empty() {
+        return Text::raw("No script tags found in the response body.");
+    }
+
+    let mut lines = Vec::new();
+    for (idx, script) in scripts.iter().enumerate() {
+        if idx > 0 {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("Script {}", idx + 1),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        match script {
+            ResponseScript::External { src } => lines.push(metadata_line("Source", src)),
+            ResponseScript::Inline { preview, bytes } => {
+                lines.push(metadata_line("Type", "inline"));
+                lines.push(metadata_line("Size", &format!("{bytes} bytes")));
+                lines.push(metadata_line("Preview", preview));
             }
         }
-        Cow::Owned(body) => {
-            for line in body.lines() {
-                lines.push(Line::raw(line.to_string()));
-            }
-        }
+    }
+
+    Text::from(lines)
+}
+
+/// Builds response trace tab text.
+fn render_response_trace_text(req: Option<&HttpRequest>, resp: &HttpResponse) -> Text<'static> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Request",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    if let Some(req) = req {
+        lines.push(metadata_line("Method", req.method.as_str()));
+        lines.push(metadata_line("URL", &req.url));
+        lines.push(metadata_line("Headers", &req.headers.len().to_string()));
+        lines.push(metadata_line(
+            "Body bytes",
+            &body_bytes(req.body.as_deref()).to_string(),
+        ));
+    } else {
+        lines.push(Line::raw("No request captured."));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Response",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(metadata_line(
+        "Status",
+        &format!("{} {}", resp.status_code, resp.status_text),
+    ));
+    lines.push(metadata_line(
+        "Duration",
+        &format_duration(resp.duration_ms),
+    ));
+    lines.push(metadata_line("Headers", &resp.headers.len().to_string()));
+    lines.push(metadata_line(
+        "Body bytes",
+        &body_bytes(Some(&resp.body)).to_string(),
+    ));
+
+    if let Some(cache) = header_value(&resp.headers, CACHE_CONTROL_HEADER) {
+        lines.push(metadata_line("Cache-Control", cache));
+    }
+    if let Some(pragma) = header_value(&resp.headers, PRAGMA_HEADER) {
+        lines.push(metadata_line("Pragma", pragma));
     }
 
     Text::from(lines)
@@ -678,9 +826,257 @@ fn format_response_body(body: &str) -> Cow<'_, str> {
         return Cow::Borrowed("");
     }
 
-    serde_json::from_str::<serde_json::Value>(trimmed)
-        .and_then(|value| serde_json::to_string_pretty(&value))
-        .map_or_else(|_| Cow::Borrowed(body), Cow::Owned)
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return serde_json::to_string_pretty(&value).map_or(Cow::Borrowed(body), Cow::Owned);
+    }
+
+    if looks_like_markup(trimmed) {
+        let pretty = format_markup_body(trimmed);
+        if pretty != trimmed {
+            return Cow::Owned(pretty);
+        }
+    }
+
+    Cow::Borrowed(body)
+}
+
+/// Returns whether a body looks like HTML or XML markup.
+fn looks_like_markup(body: &str) -> bool {
+    body.starts_with('<') && body.contains('>')
+}
+
+/// Adds readable newlines around markup tags without trying to parse HTML.
+fn format_markup_body(body: &str) -> String {
+    let mut output = String::with_capacity(body.len() + body.len() / 8);
+    let mut indent = 0usize;
+    let mut token = String::new();
+    let mut inside_tag = false;
+
+    for ch in body.chars() {
+        if ch == '<' && !inside_tag && !token.trim().is_empty() {
+            push_markup_token(&mut output, token.trim(), &mut indent);
+            token.clear();
+        }
+        token.push(ch);
+        if ch == '<' {
+            inside_tag = true;
+        }
+        if inside_tag && ch == '>' {
+            push_markup_token(&mut output, token.trim(), &mut indent);
+            token.clear();
+            inside_tag = false;
+        }
+    }
+
+    let remaining = token.trim();
+    if !remaining.is_empty() {
+        push_markup_token(&mut output, remaining, &mut indent);
+    }
+
+    output.trim_end().to_string()
+}
+
+/// Appends one formatted markup token.
+fn push_markup_token(output: &mut String, token: &str, indent: &mut usize) {
+    if token.is_empty() {
+        return;
+    }
+
+    if is_closing_tag(token) {
+        *indent = indent.saturating_sub(1);
+    }
+
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(&"  ".repeat(*indent));
+    output.push_str(token);
+
+    if is_opening_tag(token) {
+        *indent += 1;
+    }
+}
+
+/// Returns whether a markup token is a closing tag.
+fn is_closing_tag(token: &str) -> bool {
+    token.starts_with("</")
+}
+
+/// Returns whether a markup token should increase indentation.
+fn is_opening_tag(token: &str) -> bool {
+    token.starts_with('<')
+        && !token.starts_with("</")
+        && !token.starts_with("<!")
+        && !token.starts_with("<?")
+        && !token.ends_with("/>")
+}
+
+/// Parsed response cookie for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResponseCookie {
+    /// Cookie name.
+    name: String,
+    /// Cookie value.
+    value: String,
+    /// Cookie attributes after the name-value pair.
+    attributes: Vec<String>,
+}
+
+/// Returns response cookies parsed from all `Set-Cookie` headers.
+fn response_cookies(resp: &HttpResponse) -> Vec<ResponseCookie> {
+    resp.headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(SET_COOKIE_HEADER))
+        .filter_map(|(_, value)| parse_set_cookie(value))
+        .collect()
+}
+
+/// Parses a single `Set-Cookie` header value.
+fn parse_set_cookie(value: &str) -> Option<ResponseCookie> {
+    let mut parts = value.split(';').map(str::trim);
+    let name_value = parts.next()?;
+    let equals = name_value.find('=')?;
+    let name = name_value[..equals].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(ResponseCookie {
+        name: name.to_string(),
+        value: name_value[equals + 1..].trim().to_string(),
+        attributes: parts
+            .filter(|attr| !attr.is_empty())
+            .map(ToString::to_string)
+            .collect(),
+    })
+}
+
+/// Script reference derived from an HTML response body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseScript {
+    /// External script with a `src` attribute.
+    External {
+        /// Script source URL or path.
+        src: String,
+    },
+    /// Inline script content preview.
+    Inline {
+        /// First meaningful inline script content.
+        preview: String,
+        /// Full inline script byte length.
+        bytes: usize,
+    },
+}
+
+/// Returns scripts found in a response body.
+fn response_scripts(body: &str) -> Vec<ResponseScript> {
+    let mut scripts = Vec::new();
+    let mut remaining = body;
+
+    while let Some(start) = find_case_insensitive(remaining, "<script") {
+        remaining = &remaining[start..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let open_tag = &remaining[..=open_end];
+        if let Some(src) = attribute_value(open_tag, "src") {
+            scripts.push(ResponseScript::External { src });
+        } else {
+            let content_start = open_end + 1;
+            let after_open = &remaining[content_start..];
+            if let Some(close_start) = find_case_insensitive(after_open, "</script>") {
+                let content = after_open[..close_start].trim();
+                let preview = inline_script_preview(content);
+                scripts.push(ResponseScript::Inline {
+                    preview,
+                    bytes: content.len(),
+                });
+                remaining = &after_open[close_start + "</script>".len()..];
+                continue;
+            }
+        }
+        remaining = &remaining[open_end + 1..];
+    }
+
+    scripts
+}
+
+/// Returns a compact inline script preview.
+fn inline_script_preview(content: &str) -> String {
+    let preview = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if preview.chars().count() > 100 {
+        preview.chars().take(97).chain("...".chars()).collect()
+    } else if preview.is_empty() {
+        "(empty inline script)".to_string()
+    } else {
+        preview
+    }
+}
+
+/// Finds `needle` in `haystack` without ASCII case sensitivity.
+fn find_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Extracts a quoted or unquoted attribute value from a markup tag.
+fn attribute_value(tag: &str, name: &str) -> Option<String> {
+    let attr_start = find_attribute_name(tag, name)?;
+    let after_name = &tag[attr_start + name.len()..];
+    let after_equals = after_name.trim_start().strip_prefix('=')?.trim_start();
+    let mut chars = after_equals.chars();
+    let first = chars.next()?;
+
+    if first == '"' || first == '\'' {
+        let value = chars.as_str();
+        let end = value.find(first)?;
+        Some(value[..end].to_string())
+    } else {
+        let end = after_equals
+            .find(|ch: char| ch.is_whitespace() || ch == '>')
+            .unwrap_or(after_equals.len());
+        Some(after_equals[..end].to_string())
+    }
+}
+
+/// Finds an attribute name with simple markup token boundaries.
+fn find_attribute_name(tag: &str, name: &str) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(pos) = find_case_insensitive(&tag[offset..], name) {
+        let absolute = offset + pos;
+        let before = tag[..absolute].chars().next_back();
+        let after = tag[absolute + name.len()..].chars().next();
+        let valid_before = before.is_some_and(|ch| ch.is_whitespace() || ch == '<');
+        let valid_after = after.is_some_and(|ch| ch.is_whitespace() || ch == '=');
+        if valid_before && valid_after {
+            return Some(absolute);
+        }
+        offset = absolute + name.len();
+    }
+    None
+}
+
+/// Builds a metadata key/value display line.
+fn metadata_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<14}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// Returns the first header value matching `name`, ignoring ASCII case.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Returns whether a header is cache-related.
+fn is_cache_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CACHE_CONTROL_HEADER) || name.eq_ignore_ascii_case(PRAGMA_HEADER)
 }
 
 // ── Status bar ───────────────────────────────────────────────────────────────
@@ -698,10 +1094,13 @@ mod tests {
 
     use spark_core::{
         history::HistoryEntry,
-        http::{HttpMethod, HttpRequest},
+        http::{HttpMethod, HttpRequest, HttpResponse},
     };
 
-    use super::{body_bytes, format_response_body, header_bytes, response_code_buckets};
+    use super::{
+        ResponseCookie, ResponseScript, body_bytes, format_response_body, header_bytes,
+        response_code_buckets, response_cookies, response_scripts,
+    };
 
     /// Valid compact JSON is expanded for display.
     #[test]
@@ -720,6 +1119,68 @@ mod tests {
         let body = "not json\nsecond line";
 
         assert_eq!(format_response_body(body), body);
+    }
+
+    /// Compact markup is split into readable lines.
+    #[test]
+    fn response_body_formats_markup() {
+        let formatted = format_response_body("<html><body><h1>Hello</h1></body></html>");
+
+        assert_eq!(
+            formatted,
+            "<html>\n  <body>\n    <h1>\n      Hello\n    </h1>\n  </body>\n</html>"
+        );
+    }
+
+    /// Set-Cookie headers are parsed into displayable cookie records.
+    #[test]
+    fn response_cookies_parse_set_cookie_headers() {
+        let resp = response_with_headers(vec![(
+            "Set-Cookie".to_string(),
+            "session=abc; Path=/; HttpOnly".to_string(),
+        )]);
+
+        assert_eq!(
+            response_cookies(&resp),
+            vec![ResponseCookie {
+                name: "session".to_string(),
+                value: "abc".to_string(),
+                attributes: vec!["Path=/".to_string(), "HttpOnly".to_string()],
+            }]
+        );
+    }
+
+    /// Script tab data includes external and inline scripts.
+    #[test]
+    fn response_scripts_find_external_and_inline_scripts() {
+        let body = r#"<script src="/app.js"></script><script>console.log("ok");</script>"#;
+
+        assert_eq!(
+            response_scripts(body),
+            vec![
+                ResponseScript::External {
+                    src: "/app.js".to_string()
+                },
+                ResponseScript::Inline {
+                    preview: "console.log(\"ok\");".to_string(),
+                    bytes: 18,
+                },
+            ]
+        );
+    }
+
+    /// Similar attribute names do not count as script sources.
+    #[test]
+    fn response_scripts_ignore_similar_attribute_names() {
+        let body = r#"<script data-src="/app.js">window.app = true;</script>"#;
+
+        assert_eq!(
+            response_scripts(body),
+            vec![ResponseScript::Inline {
+                preview: "window.app = true;".to_string(),
+                bytes: 18,
+            }]
+        );
     }
 
     /// Header byte size uses HTTP-style serialized header lines.
@@ -776,5 +1237,16 @@ mod tests {
             || HistoryEntry::from_request(&request),
             |code| HistoryEntry::from_response(&request, code),
         )
+    }
+
+    /// Creates a response with provided headers.
+    fn response_with_headers(headers: Vec<(String, String)>) -> HttpResponse {
+        HttpResponse {
+            status_code: 200,
+            status_text: "OK".to_string(),
+            headers,
+            body: String::new(),
+            duration_ms: 10,
+        }
     }
 }

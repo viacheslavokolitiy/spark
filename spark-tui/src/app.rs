@@ -32,14 +32,64 @@ pub enum Focus {
 }
 
 /// Selected tab in the response pane.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponseTab {
-    /// Shows status, headers, and body content.
+    /// Shows prettified response body content.
     Body,
+    /// Shows response cookies derived from `Set-Cookie` headers.
+    Cookies,
+    /// Shows response headers.
+    Headers,
+    /// Shows scripts referenced or embedded in HTML response bodies.
+    Scripts,
+    /// Shows request/response timing and metadata.
+    Trace,
     /// Shows request and response byte sizes.
     Sizes,
     /// Shows response code distribution across history.
     History,
+}
+
+impl ResponseTab {
+    /// Returns every response tab in display order.
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Body,
+            Self::Cookies,
+            Self::Headers,
+            Self::Scripts,
+            Self::Trace,
+            Self::Sizes,
+            Self::History,
+        ]
+    }
+
+    /// Returns the label displayed in the response tab bar.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Body => "Body",
+            Self::Cookies => "Cookies",
+            Self::Headers => "Headers",
+            Self::Scripts => "Scripts",
+            Self::Trace => "Trace",
+            Self::Sizes => "Sizes",
+            Self::History => "History",
+        }
+    }
+
+    /// Returns the next tab in display order.
+    fn next(self) -> Self {
+        let tabs = Self::all();
+        let current = tabs.iter().position(|tab| *tab == self).unwrap_or_default();
+        tabs[(current + 1) % tabs.len()]
+    }
+
+    /// Returns the previous tab in display order.
+    fn previous(self) -> Self {
+        let tabs = Self::all();
+        let current = tabs.iter().position(|tab| *tab == self).unwrap_or_default();
+        tabs[(current + tabs.len() - 1) % tabs.len()]
+    }
 }
 
 /// Active collection shown in the sidebar.
@@ -705,21 +755,13 @@ impl App {
 
     /// Selects the next response pane tab.
     fn next_response_tab(&mut self) {
-        self.response_tab = match self.response_tab {
-            ResponseTab::Body => ResponseTab::Sizes,
-            ResponseTab::Sizes => ResponseTab::History,
-            ResponseTab::History => ResponseTab::Body,
-        };
+        self.response_tab = self.response_tab.next();
         self.response_scroll = 0;
     }
 
     /// Selects the previous response pane tab.
     fn previous_response_tab(&mut self) {
-        self.response_tab = match self.response_tab {
-            ResponseTab::Body => ResponseTab::History,
-            ResponseTab::Sizes => ResponseTab::Body,
-            ResponseTab::History => ResponseTab::Sizes,
-        };
+        self.response_tab = self.response_tab.previous();
         self.response_scroll = 0;
     }
 }

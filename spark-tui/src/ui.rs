@@ -2,7 +2,7 @@
 
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
@@ -43,6 +43,7 @@ fn method_color(method: HttpMethod) -> Color {
 /// Returns a colour appropriate for an HTTP status code.
 fn status_color(code: u16) -> Color {
     match code {
+        100..=199 => Color::Cyan,
         200..=299 => Color::Green,
         300..=399 => Color::Yellow,
         400..=499 => Color::Red,
@@ -478,56 +479,39 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
 fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Response;
 
-    let title = if app.is_sending() {
-        " Response  Sending... ".to_string()
-    } else {
-        match &app.response {
-            Some(r) => format!(
-                " Response  {} {}  {} ",
-                r.status_code,
-                r.status_text,
-                format_duration(r.duration_ms),
-            ),
-            None => " Response ".to_string(),
-        }
-    };
-
-    let block = Block::default()
-        .title(title)
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style(focused));
+    if let Some(title) = response_title(app) {
+        block = block.title(title).title_alignment(Alignment::Right);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(inner);
 
-    let selected_tab = ResponseTab::all()
-        .iter()
-        .position(|tab| *tab == app.response_tab)
-        .unwrap_or_default();
-    let tab_titles: Vec<&str> = ResponseTab::all().iter().map(|tab| tab.label()).collect();
+    render_response_tabs(frame, app.response_tab, rows[0], rows[1]);
 
-    let tabs = Tabs::new(tab_titles)
-        .select(selected_tab)
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_widget(tabs, rows[0]);
+    let content_area = rows[2];
+    if content_area.is_empty() {
+        return;
+    }
 
     if app.response_tab == ResponseTab::History {
-        render_response_history_chart(frame, &app.history, rows[1]);
+        render_response_history_chart(frame, &app.history, content_area);
         return;
     }
 
     let content: Text = match (&app.response, &app.response_tab) {
         (None, _) if app.is_sending() => Text::raw("Sending request..."),
-        (None, _) => Text::raw("No response yet. Compose a request and press Ctrl+S or Enter."),
+        (None, _) | (Some(_), ResponseTab::History) => Text::raw(String::new()),
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
         (Some(resp), ResponseTab::Cookies) => render_response_cookies_text(resp),
         (Some(resp), ResponseTab::Headers) => render_response_headers_text(resp),
@@ -538,14 +522,90 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         (Some(resp), ResponseTab::Sizes) => {
             render_response_size_text(app.last_request.as_ref(), resp)
         }
-        (Some(_), ResponseTab::History) => Text::raw(String::new()),
     };
 
     let para = Paragraph::new(content)
         .wrap(Wrap { trim: false })
         .scroll((app.response_scroll, 0));
 
-    frame.render_widget(para, rows[1]);
+    frame.render_widget(para, content_area);
+}
+
+/// Returns the response pane title, if current state should display one.
+fn response_title(app: &App) -> Option<Line<'static>> {
+    if app.is_sending() {
+        return Some(Line::raw(" Response  Sending... "));
+    }
+
+    app.response.as_ref().map(|response| {
+        Line::from(vec![
+            Span::raw(" Response "),
+            Span::styled(
+                format!(" {} ", response.status_code),
+                status_code_badge_style(response.status_code),
+            ),
+            Span::raw(" "),
+        ])
+    })
+}
+
+/// Returns the filled badge style for a response status code.
+fn status_code_badge_style(code: u16) -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(status_color(code))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Renders response tabs as labels with a selected underline row.
+fn render_response_tabs(
+    frame: &mut Frame,
+    selected: ResponseTab,
+    labels_area: Rect,
+    line_area: Rect,
+) {
+    let selected_tab = ResponseTab::all()
+        .iter()
+        .position(|tab| *tab == selected)
+        .unwrap_or_default();
+
+    let mut label_spans = Vec::new();
+    let mut underline_spans = Vec::new();
+    for (idx, tab) in ResponseTab::all().iter().enumerate() {
+        if idx > 0 {
+            label_spans.push(Span::raw("  "));
+            underline_spans.push(Span::raw("  "));
+        }
+
+        let label = tab.label();
+        let label_style = if idx == selected_tab {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let underline_style = if idx == selected_tab {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        label_spans.push(Span::styled(label, label_style));
+        underline_spans.push(Span::styled(
+            if idx == selected_tab {
+                "-".repeat(label.len())
+            } else {
+                " ".repeat(label.len())
+            },
+            underline_style,
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(label_spans)), labels_area);
+    frame.render_widget(Paragraph::new(Line::from(underline_spans)), line_area);
 }
 
 /// Counts response-code buckets represented in request history.
@@ -1139,14 +1199,21 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     //! Tests for response body rendering helpers.
 
+    use std::path::PathBuf;
+
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect, style::Color, style::Modifier};
     use spark_core::{
+        config::Config,
         history::HistoryEntry,
         http::{HttpMethod, HttpRequest, HttpResponse},
     };
 
+    use crate::app::{App, ResponseTab};
+
     use super::{
         ResponseCookie, ResponseScript, body_bytes, format_response_body, header_bytes,
-        response_code_buckets, response_cookies, response_scripts,
+        render_response_tabs, response_code_buckets, response_cookies, response_scripts,
+        response_title, status_color,
     };
 
     /// Valid compact JSON is expanded for display.
@@ -1269,6 +1336,79 @@ mod tests {
         assert_eq!(buckets.failure_4xx, 1);
         assert_eq!(buckets.failure_5xx, 2);
         assert_eq!(buckets.total(), 6);
+    }
+
+    /// Empty startup state has no response-pane title.
+    #[test]
+    fn response_title_is_absent_before_first_response() {
+        let app = app_without_persisted_state();
+
+        assert_eq!(response_title(&app), None);
+    }
+
+    /// Completed responses show only the response label and styled code.
+    #[test]
+    fn response_title_shows_styled_completed_status_code() {
+        let mut app = app_without_persisted_state();
+        app.response = Some(HttpResponse {
+            status_code: 411,
+            status_text: "Length Required".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            duration_ms: 1_250,
+        });
+
+        let title = response_title(&app).expect("response title");
+
+        assert_eq!(title.to_string(), " Response  411  ");
+        assert_eq!(title.spans[1].style.fg, Some(Color::Black));
+        assert_eq!(title.spans[1].style.bg, Some(Color::Red));
+        assert!(title.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Informational response codes get their own badge color.
+    #[test]
+    fn status_color_styles_informational_response_codes() {
+        assert_eq!(status_color(102), Color::Cyan);
+    }
+
+    /// Response tabs render without vertical delimiters and underline selection.
+    #[test]
+    fn response_tabs_render_selected_bottom_line_without_delimiters() {
+        let backend = TestBackend::new(64, 2);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_response_tabs(
+                    frame,
+                    ResponseTab::Headers,
+                    Rect::new(0, 0, 64, 1),
+                    Rect::new(0, 1, 64, 1),
+                );
+            })
+            .expect("draw response tabs");
+
+        let labels = buffer_line(terminal.backend().buffer(), 0, 64);
+        let underline = buffer_line(terminal.backend().buffer(), 1, 64);
+
+        assert!(!labels.contains('|'));
+        assert!(labels.contains("Body  Cookies  Headers  Scripts"));
+        assert!(underline.contains("              -------"));
+    }
+
+    /// Creates an app pointed at missing state files for deterministic tests.
+    fn app_without_persisted_state() -> App {
+        App::new(Config {
+            history_file: PathBuf::from("/tmp/spark-ui-test-missing-history.jsonl"),
+            saved_requests_file: PathBuf::from("/tmp/spark-ui-test-missing-saved.json"),
+        })
+    }
+
+    /// Reads one rendered buffer line as a plain string.
+    fn buffer_line(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect::<String>()
     }
 
     /// Creates a history entry with the provided response code.

@@ -8,7 +8,10 @@ use spark_core::{
     environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
     http::{HttpMethod, HttpRequest, HttpResponse},
-    saved::{SavedRequest, load_saved_requests, remove_saved_request, upsert_saved_request},
+    saved::{
+        DEFAULT_COLLECTION, SavedRequest, load_saved_requests, remove_saved_request,
+        upsert_saved_request,
+    },
 };
 
 use crate::input::TextInput;
@@ -102,6 +105,75 @@ pub enum SidebarMode {
     Saved,
 }
 
+/// Field currently focused inside the save target dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveDialogField {
+    /// Collection name input.
+    Collection,
+    /// Folder name input.
+    Folder,
+}
+
+/// Save target dialog state.
+#[derive(Debug)]
+pub struct SaveDialog {
+    /// Collection name input.
+    pub collection: TextInput,
+    /// Optional folder name input.
+    pub folder: TextInput,
+    /// Field currently receiving input.
+    pub field: SaveDialogField,
+}
+
+impl SaveDialog {
+    /// Creates a save target dialog initialized with a collection and optional folder.
+    fn new(collection: &str, folder: Option<&str>) -> Self {
+        let mut collection_input = TextInput::single_line();
+        let mut folder_input = TextInput::single_line();
+        if collection != DEFAULT_COLLECTION || folder.is_some() {
+            collection_input.set_content(collection);
+        }
+        folder_input.set_content(folder.unwrap_or(""));
+
+        Self {
+            collection: collection_input,
+            folder: folder_input,
+            field: SaveDialogField::Collection,
+        }
+    }
+
+    /// Returns the trimmed collection name, falling back to the default collection.
+    fn collection_name(&self) -> String {
+        let collection_text = self.collection.text();
+        let collection = collection_text.trim();
+        if collection.is_empty() {
+            DEFAULT_COLLECTION.to_string()
+        } else {
+            collection.to_string()
+        }
+    }
+
+    /// Returns the trimmed folder name when one is present.
+    fn folder_name(&self) -> Option<String> {
+        let folder_text = self.folder.text();
+        let folder = folder_text.trim();
+        (!folder.is_empty()).then(|| folder.to_string())
+    }
+
+    /// Moves focus to the next save dialog field.
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            SaveDialogField::Collection => SaveDialogField::Folder,
+            SaveDialogField::Folder => SaveDialogField::Collection,
+        };
+    }
+
+    /// Moves focus to the previous save dialog field.
+    fn previous_field(&mut self) {
+        self.next_field();
+    }
+}
+
 /// Which text area a generic key handler should target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextAreaTarget {
@@ -143,6 +215,8 @@ pub struct App {
     pub environments: Vec<Environment>,
     /// Currently active environment, when any environments are loaded.
     pub environment_index: Option<usize>,
+    /// Active save destination dialog.
+    pub save_dialog: Option<SaveDialog>,
     /// Most recent HTTP response.
     pub response: Option<HttpResponse>,
     /// Request that produced the most recent response.
@@ -184,6 +258,7 @@ impl App {
             sidebar_mode: SidebarMode::History,
             environments,
             environment_index,
+            save_dialog: None,
             response: None,
             last_request: None,
             pending_request: None,
@@ -227,6 +302,15 @@ impl App {
 
     /// Dispatches a key event to the appropriate handler.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.save_dialog.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_save_dialog_key(key);
+            return;
+        }
+
         // Global shortcuts regardless of focus.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -239,7 +323,7 @@ impl App {
                     return;
                 }
                 KeyCode::Char('p') => {
-                    self.save_current_request();
+                    self.open_save_dialog();
                     return;
                 }
                 KeyCode::Char('o') => {
@@ -302,11 +386,21 @@ impl App {
         let query = self.history_search.text();
         let query = query.trim();
 
-        self.saved_requests
+        let mut indices = self
+            .saved_requests
             .iter()
             .enumerate()
             .filter_map(|(idx, request)| saved_request_matches(request, query).then_some(idx))
-            .collect()
+            .collect::<Vec<_>>();
+
+        indices.sort_by(|left, right| {
+            let left_request = &self.saved_requests[*left];
+            let right_request = &self.saved_requests[*right];
+            saved_request_group_key(left_request, *left)
+                .cmp(&saved_request_group_key(right_request, *right))
+        });
+
+        indices
     }
 
     // ── Focus cycling ────────────────────────────────────────────────────────
@@ -585,14 +679,29 @@ impl App {
         self.status_message = format!("Loaded saved: {}", request.name);
     }
 
-    /// Saves the current composer contents as a reusable saved request.
-    fn save_current_request(&mut self) {
+    /// Opens the save target dialog for the current request template.
+    fn open_save_dialog(&mut self) {
+        if self.current_template_request().is_none() {
+            self.status_message = "URL is empty - enter a URL before saving.".to_string();
+            return;
+        }
+
+        let (collection, folder) = self.selected_saved_context();
+        self.save_dialog = Some(SaveDialog::new(&collection, folder.as_deref()));
+        self.status_message =
+            "Save target: edit collection/folder, Enter saves, Esc cancels.".to_string();
+    }
+
+    /// Saves the current composer contents into `collection` and `folder`.
+    fn save_current_request_to(&mut self, collection: String, folder: Option<String>) {
         let Some(request) = self.current_template_request() else {
             self.status_message = "URL is empty - enter a URL before saving.".to_string();
             return;
         };
 
-        let saved = SavedRequest::from_request(&request);
+        let mut saved = SavedRequest::from_request(&request);
+        saved.collection = collection;
+        saved.folder = folder;
         match upsert_saved_request(
             &self.config.saved_requests_file,
             &mut self.saved_requests,
@@ -602,10 +711,46 @@ impl App {
                 self.saved_index = idx;
                 self.sidebar_mode = SidebarMode::Saved;
                 let name = &self.saved_requests[idx].name;
-                self.status_message = format!("Saved request: {name}");
+                let location = saved_location_label(&self.saved_requests[idx]);
+                self.status_message = format!("Saved request: {location}/{name}");
             }
             Err(e) => {
                 self.status_message = format!("Error saving request: {e}");
+            }
+        }
+    }
+
+    /// Handles key input while the save target dialog is active.
+    fn handle_save_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.save_dialog = None;
+                self.status_message = "Save cancelled.".to_string();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.save_dialog.take() else {
+                    return;
+                };
+                self.save_current_request_to(dialog.collection_name(), dialog.folder_name());
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(dialog) = &mut self.save_dialog {
+                    dialog.next_field();
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(dialog) = &mut self.save_dialog {
+                    dialog.previous_field();
+                }
+            }
+            _ => {
+                if let Some(dialog) = &mut self.save_dialog {
+                    let input = match dialog.field {
+                        SaveDialogField::Collection => &mut dialog.collection,
+                        SaveDialogField::Folder => &mut dialog.folder,
+                    };
+                    handle_single_line_text_input(input, key);
+                }
             }
         }
     }
@@ -709,6 +854,18 @@ impl App {
             headers,
             body,
         })
+    }
+
+    /// Returns the collection/folder context for a newly saved request.
+    fn selected_saved_context(&self) -> (String, Option<String>) {
+        if self.sidebar_mode == SidebarMode::Saved
+            && self.filtered_saved_indices().contains(&self.saved_index)
+            && let Some(request) = self.saved_requests.get(self.saved_index)
+        {
+            return (request.collection.clone(), request.folder.clone());
+        }
+
+        (DEFAULT_COLLECTION.to_string(), None)
     }
 
     /// Resolves environment variables in a request template.
@@ -910,6 +1067,19 @@ fn format_headers(headers: &[(String, String)]) -> String {
     text
 }
 
+/// Applies simple single-line text editing keys to `input`.
+fn handle_single_line_text_input(input: &mut TextInput, key: KeyEvent) {
+    match key.code {
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.move_to_line_start(),
+        KeyCode::End => input.move_to_line_end(),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Char(c) => input.insert_char(c),
+        _ => {}
+    }
+}
+
 /// Returns whether a history entry matches the search query.
 fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
     let query = query.trim();
@@ -940,7 +1110,12 @@ fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
         return true;
     }
 
-    contains_case_insensitive(&request.name, query)
+    contains_case_insensitive(&request.collection, query)
+        || request
+            .folder
+            .as_deref()
+            .is_some_and(|folder| contains_case_insensitive(folder, query))
+        || contains_case_insensitive(&request.name, query)
         || contains_case_insensitive(request.method.as_str(), query)
         || contains_case_insensitive(&request.url, query)
         || check_headers(&request.headers, query)
@@ -948,6 +1123,23 @@ fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
             .body
             .as_deref()
             .is_some_and(|body| contains_case_insensitive(body, query))
+}
+
+/// Returns a slash-separated collection/folder label for a saved request.
+fn saved_location_label(request: &SavedRequest) -> String {
+    request.folder.as_ref().map_or_else(
+        || request.collection.clone(),
+        |folder| format!("{}/{folder}", request.collection),
+    )
+}
+
+/// Returns a stable grouping key for saved request display.
+fn saved_request_group_key(request: &SavedRequest, index: usize) -> (String, String, usize) {
+    (
+        request.collection.to_lowercase(),
+        request.folder.as_deref().unwrap_or("").to_lowercase(),
+        index,
+    )
 }
 
 /// Returns whether `haystack` contains `needle` without regard to case.
@@ -1042,6 +1234,20 @@ mod tests {
         saved
     }
 
+    /// Creates a saved request inside a collection and optional folder.
+    fn saved_request_in(
+        name: &str,
+        method: HttpMethod,
+        url: &str,
+        collection: &str,
+        folder: Option<&str>,
+    ) -> SavedRequest {
+        let mut saved = saved_request(name, method, url, None);
+        saved.collection = collection.to_string();
+        saved.folder = folder.map(ToString::to_string);
+        saved
+    }
+
     /// Creates a named environment with one base URL.
     fn environment(name: &str, base_url: &str) -> Environment {
         Environment {
@@ -1056,6 +1262,18 @@ mod tests {
     /// Builds a plain key event for input handler tests.
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Builds a control-modified key event for input handler tests.
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Types text through the app key handler.
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
     }
 
     /// Empty search returns every history entry.
@@ -1270,17 +1488,121 @@ mod tests {
         assert_eq!(app.filtered_saved_indices(), vec![1]);
     }
 
+    /// Saved request search matches collection and folder metadata.
+    #[test]
+    fn saved_search_matches_collection_and_folder() {
+        let mut app = app_with_saved_requests(vec![
+            saved_request_in(
+                "List users",
+                HttpMethod::Get,
+                "https://example.com/users",
+                "Identity",
+                Some("Users"),
+            ),
+            saved_request_in(
+                "Create order",
+                HttpMethod::Post,
+                "https://example.com/orders",
+                "Commerce",
+                Some("Orders"),
+            ),
+        ]);
+
+        app.history_search.set_content("identity");
+        assert_eq!(app.filtered_saved_indices(), vec![0]);
+
+        app.history_search.set_content("orders");
+        assert_eq!(app.filtered_saved_indices(), vec![1]);
+    }
+
     /// Saving the current composer pins a reusable request and selects saved mode.
     #[test]
     fn save_current_request_adds_saved_request() {
         let mut app = app_with_history(Vec::new());
         app.url.set_content("https://example.com/users");
 
-        app.save_current_request();
+        app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
 
         assert_eq!(app.sidebar_mode, SidebarMode::Saved);
         assert_eq!(app.saved_requests.len(), 1);
         assert_eq!(app.saved_requests[0].name, "GET https://example.com/users");
+        let _ = std::fs::remove_file(&app.config.saved_requests_file);
+    }
+
+    /// Ctrl+P opens a save dialog initialized for a new destination.
+    #[test]
+    fn ctrl_p_opens_save_dialog() {
+        let mut app = app_with_history(Vec::new());
+        app.url.set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('p')));
+
+        let dialog = app.save_dialog.as_ref().expect("save dialog should open");
+        assert_eq!(dialog.collection.content(), "");
+        assert_eq!(dialog.folder.content(), "");
+        assert_eq!(dialog.field, SaveDialogField::Collection);
+    }
+
+    /// The save dialog can create a new collection and folder for a request.
+    #[test]
+    fn save_dialog_saves_into_typed_collection_and_folder() {
+        let mut app = app_with_history(Vec::new());
+        app.url.set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('p')));
+        type_text(&mut app, "Identity");
+        app.handle_key(key(KeyCode::Tab));
+        type_text(&mut app, "Users");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.save_dialog.is_none());
+        assert_eq!(app.saved_requests.len(), 1);
+        assert_eq!(app.saved_requests[0].collection, "Identity");
+        assert_eq!(app.saved_requests[0].folder.as_deref(), Some("Users"));
+        assert_eq!(
+            app.status_message,
+            "Saved request: Identity/Users/GET https://example.com/users"
+        );
+        let _ = std::fs::remove_file(&app.config.saved_requests_file);
+    }
+
+    /// Escape cancels the save dialog without writing a saved request.
+    #[test]
+    fn save_dialog_escape_cancels_save() {
+        let mut app = app_with_history(Vec::new());
+        app.url.set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.save_dialog.is_none());
+        assert!(app.saved_requests.is_empty());
+        assert_eq!(app.status_message, "Save cancelled.");
+    }
+
+    /// Saving while a saved request is selected preserves its collection and folder.
+    #[test]
+    fn save_current_request_uses_selected_saved_folder_context() {
+        let mut app = app_with_saved_requests(vec![saved_request_in(
+            "List users",
+            HttpMethod::Get,
+            "https://example.com/users",
+            "Identity",
+            Some("Users"),
+        )]);
+        app.saved_index = 0;
+        app.url.set_content("https://example.com/users/42");
+
+        let (collection, folder) = app.selected_saved_context();
+        app.save_current_request_to(collection, folder);
+
+        let saved = app
+            .saved_requests
+            .iter()
+            .find(|request| request.url == "https://example.com/users/42")
+            .expect("new request should be saved");
+        assert_eq!(saved.collection, "Identity");
+        assert_eq!(saved.folder.as_deref(), Some("Users"));
         let _ = std::fs::remove_file(&app.config.saved_requests_file);
     }
 

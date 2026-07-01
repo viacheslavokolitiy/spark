@@ -6,11 +6,25 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 
+/// Default collection assigned to saved requests without explicit organization.
+pub const DEFAULT_COLLECTION: &str = "Default";
+
+/// Returns the default collection name for deserialization.
+fn default_collection() -> String {
+    DEFAULT_COLLECTION.to_string()
+}
+
 /// A reusable request stored outside transient history.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SavedRequest {
     /// Human-readable saved request name.
     pub name: String,
+    /// Collection that owns the saved request.
+    #[serde(default = "default_collection")]
+    pub collection: String,
+    /// Optional folder inside the collection.
+    #[serde(default)]
+    pub folder: Option<String>,
     /// HTTP method used.
     pub method: HttpMethod,
     /// Target URL.
@@ -29,6 +43,8 @@ impl SavedRequest {
     pub fn from_request(req: &HttpRequest) -> Self {
         Self {
             name: format!("{} {}", req.method, req.url),
+            collection: default_collection(),
+            folder: None,
             method: req.method,
             url: req.url.clone(),
             headers: req.headers.clone(),
@@ -72,7 +88,7 @@ pub fn write_saved_requests(path: &Path, requests: &[SavedRequest]) -> anyhow::R
     Ok(())
 }
 
-/// Inserts or replaces a saved request by name.
+/// Inserts or replaces a saved request by collection, folder, and name.
 ///
 /// # Errors
 /// Returns an error if rewriting the saved request file fails.
@@ -83,7 +99,7 @@ pub fn upsert_saved_request(
 ) -> anyhow::Result<usize> {
     let idx = if let Some(idx) = requests
         .iter()
-        .position(|saved| saved.name.eq_ignore_ascii_case(&request.name))
+        .position(|saved| same_saved_location(saved, &request))
     {
         requests[idx] = request;
         idx
@@ -94,6 +110,22 @@ pub fn upsert_saved_request(
 
     write_saved_requests(path, requests)?;
     Ok(idx)
+}
+
+/// Returns whether two saved requests occupy the same organizational location.
+fn same_saved_location(left: &SavedRequest, right: &SavedRequest) -> bool {
+    left.name.eq_ignore_ascii_case(&right.name)
+        && left.collection.eq_ignore_ascii_case(&right.collection)
+        && same_folder(left.folder.as_deref(), right.folder.as_deref())
+}
+
+/// Returns whether two optional folder names match.
+fn same_folder(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Removes a saved request by index.
@@ -129,6 +161,8 @@ mod tests {
     fn saved_request(name: &str, url: &str) -> SavedRequest {
         SavedRequest {
             name: name.to_string(),
+            collection: DEFAULT_COLLECTION.to_string(),
+            folder: None,
             method: HttpMethod::Get,
             url: url.to_string(),
             headers: Vec::new(),
@@ -169,6 +203,34 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url, "https://example.com/v2/users");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Upserting with the same name in a different folder adds a request.
+    #[test]
+    fn upsert_saved_request_keeps_different_folders() {
+        let path = saved_path("upsert-folder");
+        let mut requests = vec![saved_request("Users", "https://example.com/users")];
+        let mut folder_request = saved_request("users", "https://example.com/v2/users");
+        folder_request.folder = Some("Admin".to_string());
+
+        let idx = upsert_saved_request(&path, &mut requests, folder_request)
+            .expect("saved request should upsert");
+
+        assert_eq!(idx, 1);
+        assert_eq!(requests.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Old flat saved request JSON deserializes into the default collection.
+    #[test]
+    fn saved_request_deserializes_without_collection_metadata() {
+        let request: SavedRequest = serde_json::from_str(
+            r#"{"name":"Users","method":"Get","url":"https://example.com/users","headers":[],"body":null,"updated_at":"2026-04-25T00:00:00Z"}"#,
+        )
+        .expect("old saved request should deserialize");
+
+        assert_eq!(request.collection, DEFAULT_COLLECTION);
+        assert_eq!(request.folder, None);
     }
 
     /// Removing an existing request rewrites the collection.

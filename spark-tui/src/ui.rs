@@ -15,7 +15,7 @@ use tui_piechart::{
     LegendAlignment, LegendLayout, LegendPosition, PieChart, PieSlice, Resolution, symbols,
 };
 
-use crate::app::{App, Focus, ResponseTab, SidebarMode};
+use crate::app::{App, Focus, ResponseTab, SaveDialogField, SidebarMode};
 
 /// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
@@ -117,6 +117,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_composer(frame, app, composer_area);
     render_response(frame, app, response_area);
     render_status(frame, app, status_area);
+    render_save_dialog(frame, app, area);
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -255,10 +256,29 @@ fn render_saved_requests(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::History;
     let filtered_indices = app.filtered_saved_indices();
     let mut items: Vec<ListItem> = Vec::new();
+    let mut visual_map: Vec<Option<usize>> = Vec::new();
+    let mut current_collection: Option<String> = None;
+    let mut current_folder: Option<Option<String>> = None;
 
     for idx in &filtered_indices {
         let request = &app.saved_requests[*idx];
+        if current_collection.as_deref() != Some(request.collection.as_str()) {
+            items.push(saved_collection_list_item(&request.collection));
+            visual_map.push(None);
+            current_collection = Some(request.collection.clone());
+            current_folder = None;
+        }
+
+        if current_folder.as_ref() != Some(&request.folder) {
+            if let Some(folder) = &request.folder {
+                items.push(saved_folder_list_item(folder));
+                visual_map.push(None);
+            }
+            current_folder = Some(request.folder.clone());
+        }
+
         items.push(saved_request_list_item(request));
+        visual_map.push(Some(*idx));
     }
 
     if items.is_empty() {
@@ -266,14 +286,21 @@ fn render_saved_requests(frame: &mut Frame, app: &App, area: Rect) {
             "  No saved requests",
             Style::default().fg(Color::DarkGray),
         ))));
+        visual_map.push(None);
     }
 
-    let visual_selected = filtered_indices
-        .iter()
-        .position(|idx| *idx == app.saved_index);
+    let visual_selected = if filtered_indices.is_empty() {
+        None
+    } else {
+        visual_map
+            .iter()
+            .position(|idx| *idx == Some(app.saved_index))
+    };
 
     let block = Block::default()
-        .title(" Saved  (Ctrl+O: history | Enter: load | Del: remove) ")
+        .title(
+            " Saved  (Ctrl+O: history | Enter: load | Del: remove | grouped by collection/folder) ",
+        )
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
@@ -287,6 +314,26 @@ fn render_saved_requests(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Builds a collection header row for saved requests.
+fn saved_collection_list_item(collection: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!("▾ {collection}"),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )))
+}
+
+/// Builds a folder header row for saved requests.
+fn saved_folder_list_item(folder: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!("  ▾ {folder}"),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )))
 }
 
 /// Builds a list item for a saved request.
@@ -304,6 +351,7 @@ fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
     let url_span = Span::styled(request.url.as_str(), Style::default().fg(Color::DarkGray));
 
     ListItem::new(Line::from(vec![
+        Span::raw("    "),
         method_span,
         Span::raw(" "),
         name_span,
@@ -1225,6 +1273,97 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(app.status_message.as_str())
         .style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(para, area);
+}
+
+// ── Save dialog ──────────────────────────────────────────────────────────────
+
+/// Renders the save target dialog when it is active.
+fn render_save_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.save_dialog else {
+        return;
+    };
+
+    let dialog_area = centered_rect(area, 62, 11);
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .title(" Save Request ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Choose or type a collection and optional folder."),
+        rows[0],
+    );
+    render_save_dialog_input(
+        frame,
+        " Collection ",
+        dialog.collection.text().as_ref(),
+        dialog.collection.cursor_col,
+        dialog.field == SaveDialogField::Collection,
+        rows[1],
+    );
+    render_save_dialog_input(
+        frame,
+        " Folder ",
+        dialog.folder.text().as_ref(),
+        dialog.folder.cursor_col,
+        dialog.field == SaveDialogField::Folder,
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Tab: switch | Enter: save | Esc: cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
+    );
+}
+
+/// Renders one save dialog text input and places the cursor when focused.
+fn render_save_dialog_input(
+    frame: &mut Frame,
+    title: &'static str,
+    text: &str,
+    cursor_col: usize,
+    focused: bool,
+    area: Rect,
+) {
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+    let input = Paragraph::new(text).block(block);
+    frame.render_widget(input, area);
+
+    if focused {
+        let cx =
+            (area.x + 1 + cursor_offset(cursor_col)).min(area.x + area.width.saturating_sub(2));
+        let cy = area.y + 1;
+        frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Returns a centered rectangle with bounded dimensions.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 #[cfg(test)]

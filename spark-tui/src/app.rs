@@ -4,6 +4,7 @@ use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::Backend};
 use spark_core::{
+    collection_io::{CollectionFormat, export_collection, import_into_saved_requests},
     config::Config,
     environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
@@ -112,6 +113,152 @@ pub enum SaveDialogField {
     Collection,
     /// Folder name input.
     Folder,
+}
+
+/// Import/export dialog mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionIoMode {
+    /// Import external requests into saved collections.
+    Import,
+    /// Export saved collections to an external file.
+    Export,
+}
+
+/// Field currently focused inside the collection import/export dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionIoDialogField {
+    /// Format selector.
+    Format,
+    /// File path input.
+    Path,
+}
+
+/// Format selector state for collection import/export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionIoFormat {
+    /// Detect Postman or `OpenAPI` from file content.
+    Auto,
+    /// Postman Collection v2.1 JSON.
+    Postman,
+    /// `OpenAPI` 3.x JSON or YAML.
+    OpenApi,
+}
+
+impl CollectionIoFormat {
+    /// Returns the import dialog formats.
+    const fn import_options() -> &'static [Self] {
+        &[Self::Auto, Self::Postman, Self::OpenApi]
+    }
+
+    /// Returns the export dialog formats.
+    const fn export_options() -> &'static [Self] {
+        &[Self::Postman, Self::OpenApi]
+    }
+
+    /// Returns the display label for the selected format.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Postman => "Postman",
+            Self::OpenApi => "OpenAPI",
+        }
+    }
+
+    /// Returns the core collection format, if one is explicitly selected.
+    const fn explicit_format(self) -> Option<CollectionFormat> {
+        match self {
+            Self::Auto => None,
+            Self::Postman => Some(CollectionFormat::Postman),
+            Self::OpenApi => Some(CollectionFormat::OpenApi),
+        }
+    }
+}
+
+/// Collection import/export dialog state.
+#[derive(Debug)]
+pub struct CollectionIoDialog {
+    /// Whether this dialog imports or exports collections.
+    pub mode: CollectionIoMode,
+    /// Selected external collection format.
+    pub format: CollectionIoFormat,
+    /// Path to import from or export to.
+    pub path: TextInput,
+    /// Field currently receiving input.
+    pub field: CollectionIoDialogField,
+}
+
+impl CollectionIoDialog {
+    /// Creates a collection import/export dialog.
+    fn new(mode: CollectionIoMode) -> Self {
+        let mut path = TextInput::single_line();
+        path.set_content(match mode {
+            CollectionIoMode::Import => "collection.json",
+            CollectionIoMode::Export => "spark-collections.postman.json",
+        });
+        let format = match mode {
+            CollectionIoMode::Import => CollectionIoFormat::Auto,
+            CollectionIoMode::Export => CollectionIoFormat::Postman,
+        };
+        Self {
+            mode,
+            format,
+            path,
+            field: CollectionIoDialogField::Path,
+        }
+    }
+
+    /// Returns the selected format options for this dialog mode.
+    fn options(&self) -> &'static [CollectionIoFormat] {
+        match self.mode {
+            CollectionIoMode::Import => CollectionIoFormat::import_options(),
+            CollectionIoMode::Export => CollectionIoFormat::export_options(),
+        }
+    }
+
+    /// Returns the selected core format for import or export.
+    fn selected_format(&self) -> Option<CollectionFormat> {
+        self.format.explicit_format()
+    }
+
+    /// Returns the trimmed file path when present.
+    fn path(&self) -> Option<String> {
+        let path_text = self.path.text();
+        let path = path_text.trim();
+        (!path.is_empty()).then(|| path.to_string())
+    }
+
+    /// Moves focus to the next dialog field.
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            CollectionIoDialogField::Format => CollectionIoDialogField::Path,
+            CollectionIoDialogField::Path => CollectionIoDialogField::Format,
+        };
+    }
+
+    /// Moves focus to the previous dialog field.
+    fn previous_field(&mut self) {
+        self.next_field();
+    }
+
+    /// Selects the next available format.
+    fn next_format(&mut self) {
+        let options = self.options();
+        let current = options
+            .iter()
+            .position(|format| *format == self.format)
+            .unwrap_or_default();
+        self.format = options[(current + 1) % options.len()];
+    }
+
+    /// Selects the previous available format.
+    fn previous_format(&mut self) {
+        let options = self.options();
+        let current = options
+            .iter()
+            .position(|format| *format == self.format)
+            .unwrap_or_default();
+        self.format = options[(current + options.len() - 1) % options.len()];
+    }
 }
 
 /// Save target dialog state.
@@ -302,6 +449,8 @@ pub struct App {
     pub save_dialog: Option<SaveDialog>,
     /// Active request tab rename dialog.
     pub rename_tab_dialog: Option<RenameTabDialog>,
+    /// Active collection import/export dialog.
+    pub collection_io_dialog: Option<CollectionIoDialog>,
     /// Request waiting for a painted "sending" frame before execution.
     pending_request: Option<PendingRequest>,
     /// Set to `true` to exit the event loop.
@@ -335,10 +484,11 @@ impl App {
             environment_index,
             save_dialog: None,
             rename_tab_dialog: None,
+            collection_io_dialog: None,
             pending_request: None,
             should_quit: false,
             status_message: String::from(
-                "Tab: cycle focus | Ctrl+T: new tab | Ctrl+R: rename tab | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history | Ctrl+E: env",
+                "Tab: focus | Ctrl+T: tab | Ctrl+R: rename | Ctrl+S: send | Ctrl+P: save | Ctrl+L: import | Ctrl+X: export | Ctrl+O: saved/history",
             ),
         }
     }
@@ -374,6 +524,15 @@ impl App {
 
     /// Dispatches a key event to the appropriate handler.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.collection_io_dialog.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_collection_io_dialog_key(key);
+            return;
+        }
+
         if self.rename_tab_dialog.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;
@@ -405,6 +564,14 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     self.open_save_dialog();
+                    return;
+                }
+                KeyCode::Char('l') => {
+                    self.open_collection_io_dialog(CollectionIoMode::Import);
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    self.open_collection_io_dialog(CollectionIoMode::Export);
                     return;
                 }
                 KeyCode::Char('t') => {
@@ -787,6 +954,53 @@ impl App {
         self.status_message = format!("Renamed request tab to: {display_title}");
     }
 
+    /// Opens the collection import/export dialog.
+    fn open_collection_io_dialog(&mut self, mode: CollectionIoMode) {
+        self.method_dropdown_open = false;
+        self.collection_io_dialog = Some(CollectionIoDialog::new(mode));
+        self.status_message = match mode {
+            CollectionIoMode::Import => {
+                "Import collections: enter a file path, choose format, Enter imports.".to_string()
+            }
+            CollectionIoMode::Export => {
+                "Export collections: enter a file path, choose format, Enter exports.".to_string()
+            }
+        };
+    }
+
+    /// Imports saved requests from an external collection file.
+    fn import_collections_from(&mut self, path: &str, format: Option<CollectionFormat>) {
+        match import_into_saved_requests(
+            std::path::Path::new(path),
+            &self.config.saved_requests_file,
+            &mut self.saved_requests,
+            format,
+        ) {
+            Ok(count) => {
+                self.saved_index = self.saved_requests.len().saturating_sub(1);
+                self.sidebar_mode = SidebarMode::Saved;
+                self.select_latest_visible_saved_request();
+                self.status_message = format!("Imported {count} saved requests from {path}");
+            }
+            Err(e) => {
+                self.status_message = format!("Error importing collections: {e}");
+            }
+        }
+    }
+
+    /// Exports saved requests to an external collection file.
+    fn export_collections_to(&mut self, path: &str, format: CollectionFormat) {
+        match export_collection(std::path::Path::new(path), &self.saved_requests, format) {
+            Ok(()) => {
+                let count = self.saved_requests.len();
+                self.status_message = format!("Exported {count} saved requests to {path}");
+            }
+            Err(e) => {
+                self.status_message = format!("Error exporting collections: {e}");
+            }
+        }
+    }
+
     /// Toggles the sidebar between history and saved requests.
     fn toggle_sidebar_mode(&mut self) {
         self.sidebar_mode = match self.sidebar_mode {
@@ -966,6 +1180,71 @@ impl App {
             _ => {
                 if let Some(dialog) = &mut self.rename_tab_dialog {
                     handle_single_line_text_input(&mut dialog.title, key);
+                }
+            }
+        }
+    }
+
+    /// Handles key input while the collection import/export dialog is active.
+    fn handle_collection_io_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.collection_io_dialog = None;
+                self.status_message = "Collection import/export cancelled.".to_string();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.collection_io_dialog.take() else {
+                    return;
+                };
+                let Some(path) = dialog.path() else {
+                    self.status_message = "Collection file path is empty.".to_string();
+                    return;
+                };
+                match dialog.mode {
+                    CollectionIoMode::Import => {
+                        self.import_collections_from(&path, dialog.selected_format());
+                    }
+                    CollectionIoMode::Export => {
+                        let Some(format) = dialog.selected_format() else {
+                            self.status_message =
+                                "Choose Postman or OpenAPI for export.".to_string();
+                            return;
+                        };
+                        self.export_collections_to(&path, format);
+                    }
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                if let Some(dialog) = &mut self.collection_io_dialog {
+                    dialog.next_field();
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if let Some(dialog) = &mut self.collection_io_dialog {
+                    dialog.previous_field();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(dialog) = &mut self.collection_io_dialog {
+                    match dialog.field {
+                        CollectionIoDialogField::Format => dialog.previous_format(),
+                        CollectionIoDialogField::Path => dialog.path.move_left(),
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(dialog) = &mut self.collection_io_dialog {
+                    match dialog.field {
+                        CollectionIoDialogField::Format => dialog.next_format(),
+                        CollectionIoDialogField::Path => dialog.path.move_right(),
+                    }
+                }
+            }
+            _ => {
+                if let Some(dialog) = &mut self.collection_io_dialog
+                    && dialog.field == CollectionIoDialogField::Path
+                {
+                    handle_single_line_text_input(&mut dialog.path, key);
                 }
             }
         }
@@ -1805,6 +2084,114 @@ mod tests {
             app.active_tab().title(app.active_request_tab),
             "https://example.com/users"
         );
+    }
+
+    /// Ctrl+L opens the collection import dialog.
+    #[test]
+    fn ctrl_l_opens_collection_import_dialog() {
+        let mut app = app_with_history(Vec::new());
+
+        app.handle_key(ctrl_key(KeyCode::Char('l')));
+
+        let dialog = app
+            .collection_io_dialog
+            .as_ref()
+            .expect("collection import dialog should open");
+        assert_eq!(dialog.mode, CollectionIoMode::Import);
+        assert_eq!(dialog.format, CollectionIoFormat::Auto);
+        assert_eq!(dialog.field, CollectionIoDialogField::Path);
+    }
+
+    /// Ctrl+X opens the collection export dialog.
+    #[test]
+    fn ctrl_x_opens_collection_export_dialog() {
+        let mut app = app_with_history(Vec::new());
+
+        app.handle_key(ctrl_key(KeyCode::Char('x')));
+
+        let dialog = app
+            .collection_io_dialog
+            .as_ref()
+            .expect("collection export dialog should open");
+        assert_eq!(dialog.mode, CollectionIoMode::Export);
+        assert_eq!(dialog.format, CollectionIoFormat::Postman);
+        assert_eq!(dialog.field, CollectionIoDialogField::Path);
+    }
+
+    /// Import dialog reads external requests into saved collections.
+    #[test]
+    fn collection_import_dialog_imports_saved_requests() {
+        let mut app = app_with_history(Vec::new());
+        let import_path = std::env::temp_dir().join(format!("spark-tui-import-{}.json", test_id()));
+        std::fs::write(
+            &import_path,
+            r#"{
+              "info": {"name": "Identity"},
+              "item": [{
+                "name": "List users",
+                "request": {
+                  "method": "GET",
+                  "url": {"raw": "https://api.example.com/users"}
+                }
+              }]
+            }"#,
+        )
+        .expect("import fixture should write");
+
+        app.handle_key(ctrl_key(KeyCode::Char('l')));
+        app.collection_io_dialog
+            .as_mut()
+            .expect("collection import dialog should open")
+            .path
+            .set_content(import_path.to_string_lossy().as_ref());
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.collection_io_dialog.is_none());
+        assert_eq!(app.saved_requests.len(), 1);
+        assert_eq!(app.saved_requests[0].collection, "Identity");
+        assert_eq!(app.saved_requests[0].url, "https://api.example.com/users");
+        assert_eq!(
+            app.status_message,
+            format!(
+                "Imported 1 saved requests from {}",
+                import_path.to_string_lossy()
+            )
+        );
+        let _ = std::fs::remove_file(import_path);
+        let _ = std::fs::remove_file(&app.config.saved_requests_file);
+    }
+
+    /// Export dialog writes saved requests in the selected external format.
+    #[test]
+    fn collection_export_dialog_exports_saved_requests() {
+        let mut app = app_with_saved_requests(vec![saved_request_in(
+            "List users",
+            HttpMethod::Get,
+            "https://api.example.com/users",
+            "Identity",
+            Some("Users"),
+        )]);
+        let export_path = std::env::temp_dir().join(format!("spark-tui-export-{}.json", test_id()));
+
+        app.handle_key(ctrl_key(KeyCode::Char('x')));
+        app.collection_io_dialog
+            .as_mut()
+            .expect("collection export dialog should open")
+            .path
+            .set_content(export_path.to_string_lossy().as_ref());
+        app.handle_key(key(KeyCode::Enter));
+
+        let exported = std::fs::read_to_string(&export_path).expect("export should write");
+        assert!(app.collection_io_dialog.is_none());
+        assert!(exported.contains("https://schema.getpostman.com"));
+        assert_eq!(
+            app.status_message,
+            format!(
+                "Exported 1 saved requests to {}",
+                export_path.to_string_lossy()
+            )
+        );
+        let _ = std::fs::remove_file(export_path);
     }
 
     /// History navigation moves only through visible filtered requests.

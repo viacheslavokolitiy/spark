@@ -13,6 +13,11 @@ fn default_saved_requests_file() -> PathBuf {
     PathBuf::from("saved_requests.json")
 }
 
+/// Returns the default environments file path.
+fn default_environments_file() -> PathBuf {
+    PathBuf::from("environments.json")
+}
+
 /// Top-level application configuration.
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -22,6 +27,9 @@ pub struct Config {
     /// Path to the JSON file where saved requests are persisted.
     #[serde(default = "default_saved_requests_file")]
     pub saved_requests_file: PathBuf,
+    /// Path to the JSON file where environments are persisted.
+    #[serde(default = "default_environments_file")]
+    pub environments_file: PathBuf,
 }
 
 impl Config {
@@ -41,6 +49,7 @@ impl Default for Config {
         Self {
             history_file: default_history_file(),
             saved_requests_file: default_saved_requests_file(),
+            environments_file: default_environments_file(),
         }
     }
 }

@@ -2,6 +2,8 @@
 
 /// Application configuration loading.
 pub mod config;
+/// Environment storage and variable substitution.
+pub mod environment;
 /// Request history storage and retrieval in JSONL format.
 pub mod history;
 /// HTTP request/response types and curl-based execution.

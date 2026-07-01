@@ -1,2 +1,3 @@
 history_file: .history.jsonl
 saved_requests_file: .saved_requests.json
+environments_file: .environments.json

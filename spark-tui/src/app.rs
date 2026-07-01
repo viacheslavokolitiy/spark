@@ -5,6 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::Backend};
 use spark_core::{
     config::Config,
+    environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
     http::{HttpMethod, HttpRequest, HttpResponse},
     saved::{SavedRequest, load_saved_requests, remove_saved_request, upsert_saved_request},
@@ -138,6 +139,10 @@ pub struct App {
     pub saved_index: usize,
     /// Active sidebar collection.
     pub sidebar_mode: SidebarMode,
+    /// Loaded request environments.
+    pub environments: Vec<Environment>,
+    /// Currently active environment, when any environments are loaded.
+    pub environment_index: Option<usize>,
     /// Most recent HTTP response.
     pub response: Option<HttpResponse>,
     /// Request that produced the most recent response.
@@ -161,6 +166,8 @@ impl App {
         let history_index = history.len().saturating_sub(1);
         let saved_requests = load_saved_requests(&config.saved_requests_file);
         let saved_index = saved_requests.len().saturating_sub(1);
+        let environments = load_environments(&config.environments_file);
+        let environment_index = (!environments.is_empty()).then_some(0);
         Self {
             config,
             focus: Focus::History,
@@ -175,6 +182,8 @@ impl App {
             saved_requests,
             saved_index,
             sidebar_mode: SidebarMode::History,
+            environments,
+            environment_index,
             response: None,
             last_request: None,
             pending_request: None,
@@ -182,7 +191,7 @@ impl App {
             response_scroll: 0,
             should_quit: false,
             status_message: String::from(
-                "Tab: cycle focus | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history",
+                "Tab: cycle focus | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history | Ctrl+E: env",
             ),
         }
     }
@@ -237,6 +246,10 @@ impl App {
                     self.toggle_sidebar_mode();
                     return;
                 }
+                KeyCode::Char('e') => {
+                    self.select_next_environment();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -261,6 +274,13 @@ impl App {
     #[must_use]
     pub fn is_sending(&self) -> bool {
         self.pending_request.is_some()
+    }
+
+    /// Returns the active environment, if one is selected.
+    #[must_use]
+    pub fn active_environment(&self) -> Option<&Environment> {
+        self.environment_index
+            .and_then(|idx| self.environments.get(idx))
     }
 
     /// Returns indexes of history entries matching the active search query.
@@ -567,7 +587,7 @@ impl App {
 
     /// Saves the current composer contents as a reusable saved request.
     fn save_current_request(&mut self) {
-        let Some(request) = self.current_composed_request() else {
+        let Some(request) = self.current_template_request() else {
             self.status_message = "URL is empty - enter a URL before saving.".to_string();
             return;
         };
@@ -621,9 +641,16 @@ impl App {
 
     /// Queues the current request for execution after the sending state is rendered.
     pub fn send_request(&mut self) {
-        let Some(request) = self.current_composed_request() else {
+        let Some(template) = self.current_template_request() else {
             self.status_message = "URL is empty — enter a URL and try again.".to_string();
             return;
+        };
+        let request = match self.resolve_request_template(&template) {
+            Ok(request) => request,
+            Err(e) => {
+                self.status_message = format!("Environment error: {e}");
+                return;
+            }
         };
         self.method_dropdown_open = false;
         self.focus = Focus::Response;
@@ -658,8 +685,8 @@ impl App {
         }
     }
 
-    /// Builds a request from the current composer fields.
-    fn current_composed_request(&self) -> Option<HttpRequest> {
+    /// Builds an unresolved request template from the current composer fields.
+    fn current_template_request(&self) -> Option<HttpRequest> {
         let url_text = self.url.text();
         let url = url_text.trim();
         if url.is_empty() {
@@ -679,6 +706,33 @@ impl App {
         Some(HttpRequest {
             method,
             url: url.to_string(),
+            headers,
+            body,
+        })
+    }
+
+    /// Resolves environment variables in a request template.
+    fn resolve_request_template(&self, request: &HttpRequest) -> Result<HttpRequest, String> {
+        let environment = self.active_environment();
+        let url = resolve_template(&request.url, environment).map_err(|e| e.to_string())?;
+        let headers = request
+            .headers
+            .iter()
+            .map(|(key, value)| {
+                let key = resolve_template(key, environment).map_err(|e| e.to_string())?;
+                let value = resolve_template(value, environment).map_err(|e| e.to_string())?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let body = request
+            .body
+            .as_deref()
+            .map(|body| resolve_template(body, environment).map_err(|e| e.to_string()))
+            .transpose()?;
+
+        Ok(HttpRequest {
+            method: request.method,
+            url,
             headers,
             body,
         })
@@ -801,6 +855,24 @@ impl App {
         self.response_tab = self.response_tab.previous();
         self.response_scroll = 0;
     }
+
+    /// Selects the next loaded environment.
+    fn select_next_environment(&mut self) {
+        if self.environments.is_empty() {
+            self.environment_index = None;
+            self.status_message = format!(
+                "No environments loaded from {}",
+                self.config.environments_file.display()
+            );
+            return;
+        }
+
+        let next = self
+            .environment_index
+            .map_or(0, |idx| (idx + 1) % self.environments.len());
+        self.environment_index = Some(next);
+        self.status_message = format!("Environment: {}", self.environments[next].name);
+    }
 }
 
 /// Parses raw header text (`Key: Value` per line) into key-value pairs.
@@ -920,6 +992,8 @@ mod tests {
                 .join(format!("spark-tui-test-history-{test_id}.jsonl")),
             saved_requests_file: std::env::temp_dir()
                 .join(format!("spark-tui-test-saved-{test_id}.json")),
+            environments_file: std::env::temp_dir()
+                .join(format!("spark-tui-test-env-{test_id}.json")),
         });
         app.history = history;
         app.history_index = app.history.len().saturating_sub(1);
@@ -966,6 +1040,17 @@ mod tests {
         let mut saved = SavedRequest::from_request(&request);
         saved.name = name.to_string();
         saved
+    }
+
+    /// Creates a named environment with one base URL.
+    fn environment(name: &str, base_url: &str) -> Environment {
+        Environment {
+            name: name.to_string(),
+            variables: vec![
+                ("base_url".to_string(), base_url.to_string()),
+                ("token".to_string(), "abc123".to_string()),
+            ],
+        }
     }
 
     /// Builds a plain key event for input handler tests.
@@ -1214,5 +1299,69 @@ mod tests {
         assert_eq!(app.current_method(), &HttpMethod::Post);
         assert_eq!(app.url.content(), "https://example.com/orders");
         assert_eq!(app.body.content(), "{\"status\":\"pending\"}");
+    }
+
+    /// Environment cycling moves through loaded environments.
+    #[test]
+    fn ctrl_e_cycles_active_environment() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![
+            environment("Local", "http://localhost:8080"),
+            environment("Prod", "https://api.example.com"),
+        ];
+        app.environment_index = Some(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+
+        assert_eq!(
+            app.active_environment().map(|env| env.name.as_str()),
+            Some("Prod")
+        );
+        assert_eq!(app.status_message, "Environment: Prod");
+    }
+
+    /// Sending resolves variables without mutating the composer template.
+    #[test]
+    fn send_request_resolves_environment_variables() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.url.set_content("{{base_url}}/users");
+        app.headers.set_content("Authorization: Bearer {{token}}");
+        app.body.set_content("{\"source\":\"{{ base_url }}\"}");
+
+        app.send_request();
+
+        let request = app
+            .pending_request
+            .as_ref()
+            .expect("resolved request should be queued");
+        assert_eq!(request.url, "http://localhost:8080/users");
+        assert_eq!(
+            request.headers,
+            vec![("Authorization".to_string(), "Bearer abc123".to_string())]
+        );
+        assert_eq!(
+            request.body.as_deref(),
+            Some("{\"source\":\"http://localhost:8080\"}")
+        );
+        assert_eq!(app.url.content(), "{{base_url}}/users");
+    }
+
+    /// Missing variables prevent a request from being queued.
+    #[test]
+    fn send_request_reports_missing_environment_variables() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.url.set_content("{{base_url}}/users/{{user_id}}");
+
+        app.send_request();
+
+        assert!(app.pending_request.is_none());
+        assert_eq!(
+            app.status_message,
+            "Environment error: missing environment variable: user_id"
+        );
     }
 }

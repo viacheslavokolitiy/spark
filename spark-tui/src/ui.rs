@@ -316,20 +316,52 @@ fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
 
 /// Renders the request composer pane.
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    // Split composer: [method + URL row] | [headers] | [body]
+    // Split composer: [environment] | [method + URL row] | [headers] | [body]
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Percentage(40),
             Constraint::Min(3),
         ])
         .split(area);
 
-    let method_area = render_method_url(frame, app, rows[0]);
-    render_headers(frame, app, rows[1]);
-    render_body(frame, app, rows[2]);
+    render_environment_bar(frame, app, rows[0]);
+    let method_area = render_method_url(frame, app, rows[1]);
+    render_headers(frame, app, rows[2]);
+    render_body(frame, app, rows[3]);
     render_method_dropdown(frame, app, method_area);
+}
+
+/// Renders the active environment selector summary.
+fn render_environment_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let (name, detail, style) = if let Some(environment) = app.active_environment() {
+        (
+            environment.name.as_str(),
+            format!("{} variables", environment.variables.len()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "No Environment",
+            format!(
+                "Ctrl+E cycles environments from {}",
+                app.config.environments_file.display()
+            ),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let line = Line::from(vec![
+        Span::styled(" Env ", Style::default().fg(Color::DarkGray)),
+        Span::styled(name.to_string(), style),
+        Span::raw("  "),
+        Span::styled(detail, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// Renders the method selector and URL input row.
@@ -368,7 +400,7 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     // URL input
     let url_focused = app.focus == Focus::Url;
     let url_block = Block::default()
-        .title(" URL  (Enter / Ctrl+S: send | Ctrl+P: save) ")
+        .title(" URL  (Enter / Ctrl+S: send | Ctrl+P: save | {{var}} supported) ")
         .borders(Borders::ALL)
         .border_style(border_style(url_focused));
 
@@ -1401,6 +1433,7 @@ mod tests {
         App::new(Config {
             history_file: PathBuf::from("/tmp/spark-ui-test-missing-history.jsonl"),
             saved_requests_file: PathBuf::from("/tmp/spark-ui-test-missing-saved.json"),
+            environments_file: PathBuf::from("/tmp/spark-ui-test-missing-env.json"),
         })
     }
 

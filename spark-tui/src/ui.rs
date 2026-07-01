@@ -15,7 +15,10 @@ use tui_piechart::{
     LegendAlignment, LegendLayout, LegendPosition, PieChart, PieSlice, Resolution, symbols,
 };
 
-use crate::app::{App, Focus, ResponseTab, SaveDialogField, SidebarMode};
+use crate::app::{
+    App, CollectionIoDialogField, CollectionIoMode, Focus, ResponseTab, SaveDialogField,
+    SidebarMode,
+};
 
 /// Millisecond threshold at which durations switch to seconds.
 const MS_IN_SECONDS: u128 = 1_000;
@@ -125,6 +128,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_status(frame, app, status_area);
     render_save_dialog(frame, app, area);
     render_rename_tab_dialog(frame, app, area);
+    render_collection_io_dialog(frame, app, area);
 }
 
 /// Renders the open request tab selector.
@@ -1436,6 +1440,76 @@ fn render_rename_tab_dialog(frame: &mut Frame, app: &App, area: Rect) {
         Paragraph::new("Enter: rename | Esc: cancel | blank: reset")
             .style(Style::default().fg(Color::DarkGray)),
         rows[2],
+    );
+}
+
+/// Renders the collection import/export dialog when it is active.
+fn render_collection_io_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.collection_io_dialog else {
+        return;
+    };
+
+    let dialog_area = centered_rect(area, 68, 10);
+    frame.render_widget(Clear, dialog_area);
+
+    let title = match dialog.mode {
+        CollectionIoMode::Import => " Import Collections ",
+        CollectionIoMode::Export => " Export Collections ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let help = match dialog.mode {
+        CollectionIoMode::Import => "Import Postman or OpenAPI collections into saved requests.",
+        CollectionIoMode::Export => "Export all saved requests as Postman or OpenAPI JSON.",
+    };
+    frame.render_widget(Paragraph::new(help), rows[0]);
+
+    let format_style = if dialog.field == CollectionIoDialogField::Format {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Format ", Style::default().fg(Color::DarkGray)),
+            Span::styled(dialog.format.label(), format_style),
+            Span::styled(
+                "  Left/Right changes format",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        rows[1],
+    );
+
+    render_save_dialog_input(
+        frame,
+        " File path ",
+        dialog.path.text().as_ref(),
+        dialog.path.cursor_col,
+        dialog.field == CollectionIoDialogField::Path,
+        rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new("Tab: switch | Left/Right: format | Enter: run | Esc: cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[3],
     );
 }
 

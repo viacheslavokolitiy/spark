@@ -1,5 +1,7 @@
 //! Spark core library — configuration, HTTP types, request execution, and request storage.
 
+/// Import and export for saved request collections.
+pub mod collection_io;
 /// Application configuration loading.
 pub mod config;
 /// Environment storage and variable substitution.

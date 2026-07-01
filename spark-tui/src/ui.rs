@@ -104,20 +104,55 @@ pub fn render(frame: &mut Frame, app: &App) {
     let sidebar_area = columns[0];
     let central_area = columns[1];
 
-    // Central split: composer (50%) | response (50%)
+    // Central split: request tabs | composer (50%) | response (50%)
     let central_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
         .split(central_area);
 
-    let composer_area = central_rows[0];
-    let response_area = central_rows[1];
+    let request_tabs_area = central_rows[0];
+    let composer_area = central_rows[1];
+    let response_area = central_rows[2];
 
     render_sidebar(frame, app, sidebar_area);
+    render_request_tabs(frame, app, request_tabs_area);
     render_composer(frame, app, composer_area);
     render_response(frame, app, response_area);
     render_status(frame, app, status_area);
     render_save_dialog(frame, app, area);
+    render_rename_tab_dialog(frame, app, area);
+}
+
+/// Renders the open request tab selector.
+fn render_request_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let titles = app
+        .request_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, tab)| {
+            let marker = if app.is_request_tab_sending(idx) {
+                "* "
+            } else {
+                ""
+            };
+            format!(" {}{} ", marker, tab.title(idx))
+        })
+        .collect::<Vec<_>>();
+
+    let tabs = Tabs::new(titles)
+        .select(app.active_request_tab)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(tabs, area);
 }
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -452,13 +487,14 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) -> Rect {
         .borders(Borders::ALL)
         .border_style(border_style(url_focused));
 
-    let url_text = app.url.text();
+    let active_tab = app.active_tab();
+    let url_text = active_tab.url.text();
     let url_para = Paragraph::new(url_text.as_ref()).block(url_block);
     frame.render_widget(url_para, url_area);
 
     if url_focused {
         // x+1 / y+1 to step inside the border
-        let cx = (url_area.x + 1 + cursor_offset(app.url.cursor_col))
+        let cx = (url_area.x + 1 + cursor_offset(active_tab.url.cursor_col))
             .min(url_area.x + url_area.width.saturating_sub(2));
         let cy = url_area.y + 1;
         frame.set_cursor_position((cx, cy));
@@ -494,7 +530,7 @@ fn render_method_dropdown(frame: &mut Frame, app: &App, method_area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(app.focus == Focus::Method));
     let mut state = ListState::default();
-    state.select(Some(app.method_index));
+    state.select(Some(app.active_tab().method_index));
     let list = List::new(items.collect::<Vec<_>>())
         .block(block)
         .highlight_style(
@@ -515,16 +551,17 @@ fn render_headers(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
-    let headers_text = app.headers.text();
+    let active_tab = app.active_tab();
+    let headers_text = active_tab.headers.text();
     let para = Paragraph::new(headers_text.as_ref())
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 
     if focused {
-        let cx = (area.x + 1 + cursor_offset(app.headers.cursor_col))
+        let cx = (area.x + 1 + cursor_offset(active_tab.headers.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + cursor_offset(app.headers.cursor_row))
+        let cy = (area.y + 1 + cursor_offset(active_tab.headers.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
@@ -538,16 +575,17 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
-    let body_text = app.body.text();
+    let active_tab = app.active_tab();
+    let body_text = active_tab.body.text();
     let para = Paragraph::new(body_text.as_ref())
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 
     if focused {
-        let cx = (area.x + 1 + cursor_offset(app.body.cursor_col))
+        let cx = (area.x + 1 + cursor_offset(active_tab.body.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
-        let cy = (area.y + 1 + cursor_offset(app.body.cursor_row))
+        let cy = (area.y + 1 + cursor_offset(active_tab.body.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
@@ -558,6 +596,7 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
 /// Renders the response viewer pane.
 fn render_response(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Response;
+    let active_tab = app.active_tab();
 
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -577,19 +616,19 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(inner);
 
-    render_response_tabs(frame, app.response_tab, rows[0], rows[1]);
+    render_response_tabs(frame, active_tab.response_tab, rows[0], rows[1]);
 
     let content_area = rows[2];
     if content_area.is_empty() {
         return;
     }
 
-    if app.response_tab == ResponseTab::History {
+    if active_tab.response_tab == ResponseTab::History {
         render_response_history_chart(frame, &app.history, content_area);
         return;
     }
 
-    let content: Text = match (&app.response, &app.response_tab) {
+    let content: Text = match (&active_tab.response, &active_tab.response_tab) {
         (None, _) if app.is_sending() => Text::raw("Sending request..."),
         (None, _) | (Some(_), ResponseTab::History) => Text::raw(String::new()),
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
@@ -597,16 +636,16 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         (Some(resp), ResponseTab::Headers) => render_response_headers_text(resp),
         (Some(resp), ResponseTab::Scripts) => render_response_scripts_text(resp),
         (Some(resp), ResponseTab::Trace) => {
-            render_response_trace_text(app.last_request.as_ref(), resp)
+            render_response_trace_text(active_tab.last_request.as_ref(), resp)
         }
         (Some(resp), ResponseTab::Sizes) => {
-            render_response_size_text(app.last_request.as_ref(), resp)
+            render_response_size_text(active_tab.last_request.as_ref(), resp)
         }
     };
 
     let para = Paragraph::new(content)
         .wrap(Wrap { trim: false })
-        .scroll((app.response_scroll, 0));
+        .scroll((active_tab.response_scroll, 0));
 
     frame.render_widget(para, content_area);
 }
@@ -617,7 +656,7 @@ fn response_title(app: &App) -> Option<Line<'static>> {
         return Some(Line::raw(" Response  Sending... "));
     }
 
-    app.response.as_ref().map(|response| {
+    app.active_tab().response.as_ref().map(|response| {
         Line::from(vec![
             Span::raw(" Response "),
             Span::styled(
@@ -1354,6 +1393,52 @@ fn render_save_dialog_input(
     }
 }
 
+// ── Rename tab dialog ────────────────────────────────────────────────────────
+
+/// Renders the active request tab rename dialog when it is open.
+fn render_rename_tab_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.rename_tab_dialog else {
+        return;
+    };
+
+    let dialog_area = centered_rect(area, 54, 8);
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .title(" Rename Tab ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Set a custom name for the active request tab."),
+        rows[0],
+    );
+    render_save_dialog_input(
+        frame,
+        " Tab name ",
+        dialog.title.text().as_ref(),
+        dialog.title.cursor_col,
+        true,
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter: rename | Esc: cancel | blank: reset")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
+}
+
 /// Returns a centered rectangle with bounded dimensions.
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -1521,7 +1606,7 @@ mod tests {
     #[test]
     fn response_title_shows_styled_completed_status_code() {
         let mut app = app_without_persisted_state();
-        app.response = Some(HttpResponse {
+        app.request_tabs[app.active_request_tab].response = Some(HttpResponse {
             status_code: 411,
             status_text: "Length Required".to_string(),
             headers: Vec::new(),

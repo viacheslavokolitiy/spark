@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 
 /// A simple text input that supports both single-line and multi-line editing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextInput {
     /// Lines of text content.
     pub lines: Vec<String>,

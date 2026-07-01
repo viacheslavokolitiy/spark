@@ -487,9 +487,7 @@ impl App {
             collection_io_dialog: None,
             pending_request: None,
             should_quit: false,
-            status_message: String::from(
-                "Tab: focus | Ctrl+T: tab | Ctrl+R: rename | Ctrl+S: send | Ctrl+P: save | Ctrl+L: import | Ctrl+X: export | Ctrl+O: saved/history",
-            ),
+            status_message: "Ready.".to_string(),
         }
     }
 
@@ -606,6 +604,10 @@ impl App {
             }
         }
 
+        if self.handle_vim_action_key(key) {
+            return;
+        }
+
         match self.focus {
             Focus::History => self.handle_history_key(key),
             Focus::Search => self.handle_search_key(key),
@@ -615,6 +617,65 @@ impl App {
             Focus::Body => self.handle_text_area_key(key, TextAreaTarget::Body),
             Focus::Response => self.handle_response_key(key),
         }
+    }
+
+    /// Handles vim-style command keys when focus is not inside an editor.
+    fn handle_vim_action_key(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers != KeyModifiers::NONE || self.focus_accepts_text() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                true
+            }
+            KeyCode::Char('n') => {
+                self.open_new_request_tab();
+                true
+            }
+            KeyCode::Char('x') => {
+                self.close_active_request_tab();
+                true
+            }
+            KeyCode::Char('H') => {
+                self.select_previous_request_tab();
+                true
+            }
+            KeyCode::Char('L') => {
+                self.select_next_request_tab();
+                true
+            }
+            KeyCode::Char('r') => {
+                self.open_rename_tab_dialog();
+                true
+            }
+            KeyCode::Char('p') => {
+                self.open_save_dialog();
+                true
+            }
+            KeyCode::Char('I') => {
+                self.open_collection_io_dialog(CollectionIoMode::Import);
+                true
+            }
+            KeyCode::Char('X') => {
+                self.open_collection_io_dialog(CollectionIoMode::Export);
+                true
+            }
+            KeyCode::Char('e') => {
+                self.select_next_environment();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns whether the current focus should receive ordinary character input.
+    fn focus_accepts_text(&self) -> bool {
+        matches!(
+            self.focus,
+            Focus::Search | Focus::Url | Focus::Headers | Focus::Body
+        )
     }
 
     /// Returns the currently selected [`HttpMethod`].
@@ -2001,6 +2062,48 @@ mod tests {
         assert_eq!(app.request_tabs.len(), 1);
         assert_eq!(app.active_tab().url.content(), "");
         assert_eq!(app.status_message, "Cleared the only request tab.");
+    }
+
+    /// Vim-style action keys work when focus is not editing text.
+    #[test]
+    fn vim_action_keys_work_outside_text_inputs() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::History;
+
+        app.handle_key(key(KeyCode::Char('n')));
+
+        assert_eq!(app.request_tabs.len(), 2);
+        assert_eq!(app.active_request_tab, 1);
+
+        app.focus = Focus::History;
+        app.handle_key(key(KeyCode::Char('H')));
+
+        assert_eq!(app.active_request_tab, 0);
+
+        app.focus = Focus::History;
+        app.handle_key(key(KeyCode::Char('L')));
+
+        assert_eq!(app.active_request_tab, 1);
+
+        app.focus = Focus::History;
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.request_tabs.len(), 1);
+    }
+
+    /// Vim-style action keys do not steal ordinary text input from editors.
+    #[test]
+    fn vim_action_keys_do_not_run_inside_text_inputs() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::Url;
+
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_key(key(KeyCode::Char('p')));
+        app.handle_key(key(KeyCode::Char('x')));
+
+        assert_eq!(app.request_tabs.len(), 1);
+        assert_eq!(app.active_tab().url.content(), "npx");
+        assert!(app.save_dialog.is_none());
     }
 
     /// Ctrl+R opens the active request tab rename dialog.

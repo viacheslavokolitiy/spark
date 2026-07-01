@@ -28,6 +28,54 @@ const SET_COOKIE_HEADER: &str = "set-cookie";
 const CACHE_CONTROL_HEADER: &str = "cache-control";
 /// Legacy header name used by servers to disable cache.
 const PRAGMA_HEADER: &str = "pragma";
+/// Always-visible footer navigation key help.
+const VIM_NAV_KEY_HELP: &str = "j/k move  h/l switch  H/L tabs  Tab focus  Enter open/send  q quit";
+/// Always-visible footer action key help.
+const VIM_ACTION_KEY_HELP: &str = "n new  x close  r rename  p save  I import  X export  e env";
+/// Always-visible legacy control shortcut help.
+const CONTROL_KEY_HELP: &str = "^S send ^P save ^L import ^X export ^T new ^W close ^R ren ^O side";
+
+/// Operating-system family used to label visible key help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyHelpPlatform {
+    /// Apple macOS terminals.
+    MacOs,
+    /// Windows terminals.
+    Windows,
+    /// Linux and other Unix-like terminals.
+    Linux,
+}
+
+impl KeyHelpPlatform {
+    /// Returns the platform label used for vim-style navigation bindings.
+    const fn nav_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "mac nav",
+            Self::Windows => "win nav",
+            Self::Linux => "linux nav",
+        }
+    }
+
+    /// Returns the platform label used for vim-style action bindings.
+    const fn vim_label(self) -> &'static str {
+        match self {
+            Self::MacOs => "mac vim",
+            Self::Windows => "win vim",
+            Self::Linux => "linux vim",
+        }
+    }
+}
+
+/// Returns the key-help platform for the current build target.
+fn current_key_help_platform() -> KeyHelpPlatform {
+    if cfg!(target_os = "macos") {
+        KeyHelpPlatform::MacOs
+    } else if cfg!(target_os = "windows") {
+        KeyHelpPlatform::Windows
+    } else {
+        KeyHelpPlatform::Linux
+    }
+}
 
 // ── Color helpers ────────────────────────────────────────────────────────────
 
@@ -89,14 +137,19 @@ fn border_style(focused: bool) -> Style {
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
 
-    // Root split: content area + 1-line status bar
+    // Root split: content area + status row + always-visible key help rows.
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
         .split(area);
 
     let main_area = root[0];
     let status_area = root[1];
+    let key_help_area = root[2];
 
     // Horizontal split: sidebar (25%) | central pane (75%)
     let columns = Layout::default()
@@ -126,6 +179,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_composer(frame, app, composer_area);
     render_response(frame, app, response_area);
     render_status(frame, app, status_area);
+    render_key_help(frame, key_help_area);
     render_save_dialog(frame, app, area);
     render_rename_tab_dialog(frame, app, area);
     render_collection_io_dialog(frame, app, area);
@@ -1318,6 +1372,38 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// Renders the persistent keybinding help row.
+fn render_key_help(frame: &mut Frame, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let platform = current_key_help_platform();
+    render_key_help_line(frame, platform.nav_label(), VIM_NAV_KEY_HELP, rows[0]);
+    render_key_help_line(frame, platform.vim_label(), VIM_ACTION_KEY_HELP, rows[1]);
+    render_key_help_line(frame, "ctrl", CONTROL_KEY_HELP, rows[2]);
+}
+
+/// Renders one persistent keybinding help line.
+fn render_key_help_line(frame: &mut Frame, label: &'static str, help: &'static str, area: Rect) {
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" {label} "),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+        Span::raw(" "),
+        Span::styled(help, Style::default().fg(Color::Gray).bg(Color::Black)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
 // ── Save dialog ──────────────────────────────────────────────────────────────
 
 /// Renders the save target dialog when it is active.
@@ -1541,9 +1627,9 @@ mod tests {
     use crate::app::{App, ResponseTab};
 
     use super::{
-        ResponseCookie, ResponseScript, body_bytes, format_response_body, header_bytes,
-        render_response_tabs, response_code_buckets, response_cookies, response_scripts,
-        response_title, status_color,
+        KeyHelpPlatform, ResponseCookie, ResponseScript, body_bytes, current_key_help_platform,
+        format_response_body, header_bytes, render, render_response_tabs, response_code_buckets,
+        response_cookies, response_scripts, response_title, status_color,
     };
 
     /// Valid compact JSON is expanded for display.
@@ -1724,6 +1810,48 @@ mod tests {
         assert!(!labels.contains('|'));
         assert!(labels.contains("Body  Cookies  Headers  Scripts"));
         assert!(underline.contains("              -------"));
+    }
+
+    /// Status messages and key help render on separate footer rows.
+    #[test]
+    fn footer_keeps_key_help_visible_with_long_status() {
+        let backend = TestBackend::new(96, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = app_without_persisted_state();
+        app.status_message =
+            "Loaded: GET https://api.example.com/users/with/a/very/long/path".to_string();
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("draw full ui");
+
+        let status = buffer_line(terminal.backend().buffer(), 20, 96);
+        let nav_keys = buffer_line(terminal.backend().buffer(), 21, 96);
+        let cmd_keys = buffer_line(terminal.backend().buffer(), 22, 96);
+        let ctrl_keys = buffer_line(terminal.backend().buffer(), 23, 96);
+
+        assert!(status.contains("Loaded: GET"));
+        assert!(!status.contains("j/k move"));
+        assert!(nav_keys.contains(current_key_help_platform().nav_label()));
+        assert!(nav_keys.contains("j/k move"));
+        assert!(nav_keys.contains("q quit"));
+        assert!(cmd_keys.contains(current_key_help_platform().vim_label()));
+        assert!(cmd_keys.contains("I import"));
+        assert!(cmd_keys.contains("X export"));
+        assert!(ctrl_keys.contains("ctrl"));
+        assert!(ctrl_keys.contains("^L import"));
+        assert!(ctrl_keys.contains("^X export"));
+    }
+
+    /// Platform-specific key help labels are distinct.
+    #[test]
+    fn key_help_platform_labels_are_os_specific() {
+        assert_eq!(KeyHelpPlatform::MacOs.nav_label(), "mac nav");
+        assert_eq!(KeyHelpPlatform::MacOs.vim_label(), "mac vim");
+        assert_eq!(KeyHelpPlatform::Windows.nav_label(), "win nav");
+        assert_eq!(KeyHelpPlatform::Windows.vim_label(), "win vim");
+        assert_eq!(KeyHelpPlatform::Linux.nav_label(), "linux nav");
+        assert_eq!(KeyHelpPlatform::Linux.vim_label(), "linux vim");
     }
 
     /// Creates an app pointed at missing state files for deterministic tests.

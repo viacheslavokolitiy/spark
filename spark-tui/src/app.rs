@@ -174,6 +174,29 @@ impl SaveDialog {
     }
 }
 
+/// Rename dialog state for the active request tab.
+#[derive(Debug)]
+pub struct RenameTabDialog {
+    /// New tab title input.
+    pub title: TextInput,
+}
+
+impl RenameTabDialog {
+    /// Creates a rename dialog initialized with the current tab title.
+    fn new(title: &str) -> Self {
+        let mut input = TextInput::single_line();
+        input.set_content(title);
+        Self { title: input }
+    }
+
+    /// Returns the trimmed custom tab title, when present.
+    fn title(&self) -> Option<String> {
+        let title_text = self.title.text();
+        let title = title_text.trim();
+        (!title.is_empty()).then(|| title.to_string())
+    }
+}
+
 /// Which text area a generic key handler should target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextAreaTarget {
@@ -183,22 +206,82 @@ enum TextAreaTarget {
     Body,
 }
 
+/// Editable request workspace shown as one top-level tab.
+#[derive(Debug)]
+pub struct RequestTab {
+    /// Optional custom display name for this tab.
+    pub custom_title: Option<String>,
+    /// HTTP method selection index for this tab.
+    pub method_index: usize,
+    /// URL input for this tab.
+    pub url: TextInput,
+    /// Header editor for this tab.
+    pub headers: TextInput,
+    /// Body editor for this tab.
+    pub body: TextInput,
+    /// Most recent response for this tab.
+    pub response: Option<HttpResponse>,
+    /// Request that produced the most recent response for this tab.
+    pub last_request: Option<HttpRequest>,
+    /// Active response sub-tab for this request tab.
+    pub response_tab: ResponseTab,
+    /// Vertical scroll offset for the response viewer in this tab.
+    pub response_scroll: u16,
+}
+
+impl RequestTab {
+    /// Creates a blank request tab.
+    fn blank() -> Self {
+        Self {
+            custom_title: None,
+            method_index: 0,
+            url: TextInput::single_line(),
+            headers: TextInput::multi_line(),
+            body: TextInput::multi_line(),
+            response: None,
+            last_request: None,
+            response_tab: ResponseTab::Body,
+            response_scroll: 0,
+        }
+    }
+
+    /// Returns a compact display label for the tab bar.
+    pub fn title(&self, index: usize) -> String {
+        if let Some(title) = &self.custom_title {
+            return title.clone();
+        }
+
+        let url_text = self.url.text();
+        let trimmed = url_text.trim();
+        if trimmed.is_empty() {
+            format!("Untitled {}", index + 1)
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
+/// Request queued for execution from a specific tab.
+#[derive(Debug)]
+struct PendingRequest {
+    /// Index of the tab that started the request.
+    tab_index: usize,
+    /// Fully resolved request ready for execution.
+    request: HttpRequest,
+}
+
 /// Complete application state.
 pub struct App {
     /// Application configuration.
     pub config: Config,
     /// Currently focused element.
     pub focus: Focus,
-    /// Index into [`HttpMethod::all()`] for the selected method.
-    pub method_index: usize,
     /// Whether the request method dropdown is expanded.
     pub method_dropdown_open: bool,
-    /// URL input.
-    pub url: TextInput,
-    /// Headers input (one `Key: Value` per line).
-    pub headers: TextInput,
-    /// Request body input.
-    pub body: TextInput,
+    /// Open request workspaces.
+    pub request_tabs: Vec<RequestTab>,
+    /// Currently selected request workspace.
+    pub active_request_tab: usize,
     /// Request history search input.
     pub history_search: TextInput,
     /// Loaded request history (oldest first).
@@ -217,16 +300,10 @@ pub struct App {
     pub environment_index: Option<usize>,
     /// Active save destination dialog.
     pub save_dialog: Option<SaveDialog>,
-    /// Most recent HTTP response.
-    pub response: Option<HttpResponse>,
-    /// Request that produced the most recent response.
-    pub last_request: Option<HttpRequest>,
+    /// Active request tab rename dialog.
+    pub rename_tab_dialog: Option<RenameTabDialog>,
     /// Request waiting for a painted "sending" frame before execution.
-    pending_request: Option<HttpRequest>,
-    /// Active tab in the response pane.
-    pub response_tab: ResponseTab,
-    /// Vertical scroll offset for the response viewer.
-    pub response_scroll: u16,
+    pending_request: Option<PendingRequest>,
     /// Set to `true` to exit the event loop.
     pub should_quit: bool,
     /// One-line message shown in the status bar.
@@ -245,11 +322,9 @@ impl App {
         Self {
             config,
             focus: Focus::History,
-            method_index: 0,
             method_dropdown_open: false,
-            url: TextInput::single_line(),
-            headers: TextInput::multi_line(),
-            body: TextInput::multi_line(),
+            request_tabs: vec![RequestTab::blank()],
+            active_request_tab: 0,
             history_search: TextInput::single_line(),
             history,
             history_index,
@@ -259,14 +334,11 @@ impl App {
             environments,
             environment_index,
             save_dialog: None,
-            response: None,
-            last_request: None,
+            rename_tab_dialog: None,
             pending_request: None,
-            response_tab: ResponseTab::Body,
-            response_scroll: 0,
             should_quit: false,
             status_message: String::from(
-                "Tab: cycle focus | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history | Ctrl+E: env",
+                "Tab: cycle focus | Ctrl+T: new tab | Ctrl+R: rename tab | Ctrl+S: send | Ctrl+P: save | Ctrl+O: saved/history | Ctrl+E: env",
             ),
         }
     }
@@ -302,6 +374,15 @@ impl App {
 
     /// Dispatches a key event to the appropriate handler.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.rename_tab_dialog.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_rename_tab_dialog_key(key);
+            return;
+        }
+
         if self.save_dialog.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;
@@ -324,6 +405,26 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     self.open_save_dialog();
+                    return;
+                }
+                KeyCode::Char('t') => {
+                    self.open_new_request_tab();
+                    return;
+                }
+                KeyCode::Char('w') => {
+                    self.close_active_request_tab();
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    self.open_rename_tab_dialog();
+                    return;
+                }
+                KeyCode::Left => {
+                    self.select_previous_request_tab();
+                    return;
+                }
+                KeyCode::Right => {
+                    self.select_next_request_tab();
                     return;
                 }
                 KeyCode::Char('o') => {
@@ -351,13 +452,34 @@ impl App {
 
     /// Returns the currently selected [`HttpMethod`].
     pub fn current_method(&self) -> &HttpMethod {
-        &HttpMethod::all()[self.method_index]
+        &HttpMethod::all()[self.active_tab().method_index]
     }
 
     /// Returns whether a request is queued or currently being started.
     #[must_use]
     pub fn is_sending(&self) -> bool {
-        self.pending_request.is_some()
+        self.pending_request
+            .as_ref()
+            .is_some_and(|pending| pending.tab_index == self.active_request_tab)
+    }
+
+    /// Returns whether `tab_index` has a request queued or executing.
+    #[must_use]
+    pub fn is_request_tab_sending(&self, tab_index: usize) -> bool {
+        self.pending_request
+            .as_ref()
+            .is_some_and(|pending| pending.tab_index == tab_index)
+    }
+
+    /// Returns the currently active request tab.
+    #[must_use]
+    pub fn active_tab(&self) -> &RequestTab {
+        &self.request_tabs[self.active_request_tab]
+    }
+
+    /// Returns the currently active request tab mutably.
+    fn active_tab_mut(&mut self) -> &mut RequestTab {
+        &mut self.request_tabs[self.active_request_tab]
     }
 
     /// Returns the active environment, if one is selected.
@@ -532,12 +654,12 @@ impl App {
             _ => {}
         }
         match key.code {
-            KeyCode::Left => self.url.move_left(),
-            KeyCode::Right => self.url.move_right(),
-            KeyCode::Home => self.url.move_to_line_start(),
-            KeyCode::End => self.url.move_to_line_end(),
-            KeyCode::Backspace => self.url.backspace(),
-            KeyCode::Char(c) => self.url.insert_char(c),
+            KeyCode::Left => self.active_tab_mut().url.move_left(),
+            KeyCode::Right => self.active_tab_mut().url.move_right(),
+            KeyCode::Home => self.active_tab_mut().url.move_to_line_start(),
+            KeyCode::End => self.active_tab_mut().url.move_to_line_end(),
+            KeyCode::Backspace => self.active_tab_mut().url.backspace(),
+            KeyCode::Char(c) => self.active_tab_mut().url.insert_char(c),
             _ => {}
         }
     }
@@ -558,8 +680,8 @@ impl App {
         }
 
         let area = match target {
-            TextAreaTarget::Headers => &mut self.headers,
-            TextAreaTarget::Body => &mut self.body,
+            TextAreaTarget::Headers => &mut self.active_tab_mut().headers,
+            TextAreaTarget::Body => &mut self.active_tab_mut().body,
         };
 
         match key.code {
@@ -584,18 +706,86 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => self.previous_response_tab(),
             KeyCode::Right | KeyCode::Char('l') => self.next_response_tab(),
             KeyCode::Down | KeyCode::Char('j') => {
-                self.response_scroll = self.response_scroll.saturating_add(1);
+                let tab = self.active_tab_mut();
+                tab.response_scroll = tab.response_scroll.saturating_add(1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.response_scroll = self.response_scroll.saturating_sub(1);
+                let tab = self.active_tab_mut();
+                tab.response_scroll = tab.response_scroll.saturating_sub(1);
             }
-            KeyCode::Char('g') => self.response_scroll = 0,
+            KeyCode::Char('g') => self.active_tab_mut().response_scroll = 0,
             KeyCode::Char('q') => self.should_quit = true,
             _ => {}
         }
     }
 
     // ── Actions ──────────────────────────────────────────────────────────────
+
+    /// Opens a blank request tab and selects it.
+    fn open_new_request_tab(&mut self) {
+        self.method_dropdown_open = false;
+        self.request_tabs.push(RequestTab::blank());
+        self.active_request_tab = self.request_tabs.len() - 1;
+        self.focus = Focus::Url;
+        self.status_message = format!("Opened request tab {}", self.active_request_tab + 1);
+    }
+
+    /// Closes the current request tab, preserving one blank tab at minimum.
+    fn close_active_request_tab(&mut self) {
+        self.method_dropdown_open = false;
+        if self.request_tabs.len() == 1 {
+            self.request_tabs[0] = RequestTab::blank();
+            self.pending_request = None;
+            self.status_message = "Cleared the only request tab.".to_string();
+            return;
+        }
+
+        let closed = self.active_request_tab;
+        self.request_tabs.remove(closed);
+        if let Some(mut pending) = self.pending_request.take()
+            && pending.tab_index != closed
+        {
+            if pending.tab_index > closed {
+                pending.tab_index -= 1;
+            }
+            self.pending_request = Some(pending);
+        }
+        self.active_request_tab = closed.min(self.request_tabs.len().saturating_sub(1));
+        self.status_message = format!("Closed request tab {}", closed + 1);
+    }
+
+    /// Selects the next open request tab.
+    fn select_next_request_tab(&mut self) {
+        self.method_dropdown_open = false;
+        self.active_request_tab = (self.active_request_tab + 1) % self.request_tabs.len();
+        self.status_message = format!("Request tab {}", self.active_request_tab + 1);
+    }
+
+    /// Selects the previous open request tab.
+    fn select_previous_request_tab(&mut self) {
+        self.method_dropdown_open = false;
+        self.active_request_tab = if self.active_request_tab == 0 {
+            self.request_tabs.len() - 1
+        } else {
+            self.active_request_tab - 1
+        };
+        self.status_message = format!("Request tab {}", self.active_request_tab + 1);
+    }
+
+    /// Opens the active request tab rename dialog.
+    fn open_rename_tab_dialog(&mut self) {
+        self.method_dropdown_open = false;
+        let current_title = self.active_tab().custom_title.clone().unwrap_or_default();
+        self.rename_tab_dialog = Some(RenameTabDialog::new(&current_title));
+        self.status_message = "Rename tab: Enter applies, Esc cancels, blank resets.".to_string();
+    }
+
+    /// Applies a custom title to the active request tab.
+    fn rename_active_request_tab(&mut self, title: Option<String>) {
+        self.active_tab_mut().custom_title = title;
+        let display_title = self.active_tab().title(self.active_request_tab);
+        self.status_message = format!("Renamed request tab to: {display_title}");
+    }
 
     /// Toggles the sidebar between history and saved requests.
     fn toggle_sidebar_mode(&mut self) {
@@ -632,20 +822,22 @@ impl App {
             return;
         }
 
-        if let Some(idx) = HttpMethod::all().iter().position(|m| *m == entry.method) {
-            self.method_index = idx;
+        let method = entry.method;
+        let url = entry.url.clone();
+        let headers_text = format_headers(&entry.headers);
+        let body_text = entry.body.clone().unwrap_or_default();
+
+        if let Some(idx) = HttpMethod::all().iter().position(|m| *m == method) {
+            self.active_tab_mut().method_index = idx;
         }
 
-        self.url.set_content(&entry.url);
-
-        let headers_text = format_headers(&entry.headers);
-        self.headers.set_content(&headers_text);
-
-        self.body.set_content(entry.body.as_deref().unwrap_or(""));
+        self.active_tab_mut().url.set_content(&url);
+        self.active_tab_mut().headers.set_content(&headers_text);
+        self.active_tab_mut().body.set_content(&body_text);
 
         self.method_dropdown_open = false;
         self.focus = Focus::Url;
-        self.status_message = format!("Loaded: {} {}", entry.method, entry.url);
+        self.status_message = format!("Loaded: {method} {url}");
     }
 
     /// Loads the selected saved request into the request composer.
@@ -663,20 +855,23 @@ impl App {
             return;
         }
 
-        if let Some(idx) = HttpMethod::all().iter().position(|m| *m == request.method) {
-            self.method_index = idx;
+        let method = request.method;
+        let url = request.url.clone();
+        let name = request.name.clone();
+        let headers_text = format_headers(&request.headers);
+        let body_text = request.body.clone().unwrap_or_default();
+
+        if let Some(idx) = HttpMethod::all().iter().position(|m| *m == method) {
+            self.active_tab_mut().method_index = idx;
         }
 
-        self.url.set_content(&request.url);
-
-        let headers_text = format_headers(&request.headers);
-        self.headers.set_content(&headers_text);
-
-        self.body.set_content(request.body.as_deref().unwrap_or(""));
+        self.active_tab_mut().url.set_content(&url);
+        self.active_tab_mut().headers.set_content(&headers_text);
+        self.active_tab_mut().body.set_content(&body_text);
 
         self.method_dropdown_open = false;
         self.focus = Focus::Url;
-        self.status_message = format!("Loaded saved: {}", request.name);
+        self.status_message = format!("Loaded saved: {name}");
     }
 
     /// Opens the save target dialog for the current request template.
@@ -755,6 +950,27 @@ impl App {
         }
     }
 
+    /// Handles key input while the rename tab dialog is active.
+    fn handle_rename_tab_dialog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.rename_tab_dialog = None;
+                self.status_message = "Rename cancelled.".to_string();
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.rename_tab_dialog.take() else {
+                    return;
+                };
+                self.rename_active_request_tab(dialog.title());
+            }
+            _ => {
+                if let Some(dialog) = &mut self.rename_tab_dialog {
+                    handle_single_line_text_input(&mut dialog.title, key);
+                }
+            }
+        }
+    }
+
     /// Removes the selected saved request when the saved sidebar is active.
     fn remove_selected_saved_request(&mut self) {
         if self.sidebar_mode != SidebarMode::Saved {
@@ -799,17 +1015,20 @@ impl App {
         };
         self.method_dropdown_open = false;
         self.focus = Focus::Response;
-        self.response_tab = ResponseTab::Body;
-        self.response_scroll = 0;
+        let tab_index = self.active_request_tab;
+        let tab = self.active_tab_mut();
+        tab.response_tab = ResponseTab::Body;
+        tab.response_scroll = 0;
         self.status_message = format!("Sending {} {}…", request.method, request.url);
-        self.pending_request = Some(request);
+        self.pending_request = Some(PendingRequest { tab_index, request });
     }
 
     /// Executes a queued request, writing the result to history.
     fn execute_pending_request(&mut self) {
-        let Some(request) = self.pending_request.take() else {
+        let Some(pending) = self.pending_request.take() else {
             return;
         };
+        let request = pending.request;
         match request.execute() {
             Ok(response) => {
                 let entry = HistoryEntry::from_response(&request, response.status_code);
@@ -821,8 +1040,10 @@ impl App {
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
                 self.select_latest_visible_sidebar_item();
-                self.last_request = Some(request);
-                self.response = Some(response);
+                if let Some(tab) = self.request_tabs.get_mut(pending.tab_index) {
+                    tab.last_request = Some(request);
+                    tab.response = Some(response);
+                }
             }
             Err(e) => {
                 self.status_message = format!("Error: {e}");
@@ -832,16 +1053,17 @@ impl App {
 
     /// Builds an unresolved request template from the current composer fields.
     fn current_template_request(&self) -> Option<HttpRequest> {
-        let url_text = self.url.text();
+        let tab = self.active_tab();
+        let url_text = tab.url.text();
         let url = url_text.trim();
         if url.is_empty() {
             return None;
         }
 
         let method = *self.current_method();
-        let headers_text = self.headers.text();
+        let headers_text = tab.headers.text();
         let headers = parse_headers(headers_text.as_ref());
-        let body_text = self.body.text();
+        let body_text = tab.body.text();
         let body = if body_text.trim().is_empty() {
             None
         } else {
@@ -988,29 +1210,33 @@ impl App {
     /// Selects the previous HTTP method.
     fn select_previous_method(&mut self) {
         let count = HttpMethod::all().len();
-        self.method_index = if self.method_index == 0 {
+        let tab = self.active_tab_mut();
+        tab.method_index = if tab.method_index == 0 {
             count - 1
         } else {
-            self.method_index - 1
+            tab.method_index - 1
         };
     }
 
     /// Selects the next HTTP method.
     fn select_next_method(&mut self) {
         let count = HttpMethod::all().len();
-        self.method_index = (self.method_index + 1) % count;
+        let tab = self.active_tab_mut();
+        tab.method_index = (tab.method_index + 1) % count;
     }
 
     /// Selects the next response pane tab.
     fn next_response_tab(&mut self) {
-        self.response_tab = self.response_tab.next();
-        self.response_scroll = 0;
+        let tab = self.active_tab_mut();
+        tab.response_tab = tab.response_tab.next();
+        tab.response_scroll = 0;
     }
 
     /// Selects the previous response pane tab.
     fn previous_response_tab(&mut self) {
-        self.response_tab = self.response_tab.previous();
-        self.response_scroll = 0;
+        let tab = self.active_tab_mut();
+        tab.response_tab = tab.response_tab.previous();
+        tab.response_scroll = 0;
     }
 
     /// Selects the next loaded environment.
@@ -1425,6 +1651,162 @@ mod tests {
         assert_eq!(app.focus, Focus::Url);
     }
 
+    /// Ctrl+T opens a new blank request tab and focuses the URL.
+    #[test]
+    fn ctrl_t_opens_blank_request_tab() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+
+        assert_eq!(app.request_tabs.len(), 2);
+        assert_eq!(app.active_request_tab, 1);
+        assert_eq!(app.focus, Focus::Url);
+        assert_eq!(app.active_tab().url.content(), "");
+    }
+
+    /// Ctrl+Left and Ctrl+Right switch request tabs without losing draft state.
+    #[test]
+    fn ctrl_arrows_switch_request_tabs_and_preserve_drafts() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/orders");
+
+        app.handle_key(ctrl_key(KeyCode::Left));
+
+        assert_eq!(app.active_request_tab, 0);
+        assert_eq!(app.active_tab().url.content(), "https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Right));
+
+        assert_eq!(app.active_request_tab, 1);
+        assert_eq!(app.active_tab().url.content(), "https://example.com/orders");
+    }
+
+    /// Ctrl+W closes the active request tab and selects a remaining tab.
+    #[test]
+    fn ctrl_w_closes_active_request_tab() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+        app.handle_key(ctrl_key(KeyCode::Char('t')));
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/orders");
+
+        app.handle_key(ctrl_key(KeyCode::Char('w')));
+
+        assert_eq!(app.request_tabs.len(), 1);
+        assert_eq!(app.active_request_tab, 0);
+        assert_eq!(app.active_tab().url.content(), "https://example.com/users");
+    }
+
+    /// Closing the final request tab clears it rather than leaving no workspace.
+    #[test]
+    fn ctrl_w_clears_final_request_tab() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('w')));
+
+        assert_eq!(app.request_tabs.len(), 1);
+        assert_eq!(app.active_tab().url.content(), "");
+        assert_eq!(app.status_message, "Cleared the only request tab.");
+    }
+
+    /// Ctrl+R opens the active request tab rename dialog.
+    #[test]
+    fn ctrl_r_opens_rename_tab_dialog() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('r')));
+
+        let dialog = app
+            .rename_tab_dialog
+            .as_ref()
+            .expect("rename dialog should open");
+        assert_eq!(dialog.title.content(), "");
+        assert_eq!(
+            app.status_message,
+            "Rename tab: Enter applies, Esc cancels, blank resets."
+        );
+    }
+
+    /// Enter in the rename dialog applies a custom active tab title.
+    #[test]
+    fn rename_tab_dialog_applies_custom_title() {
+        let mut app = app_with_history(Vec::new());
+
+        app.handle_key(ctrl_key(KeyCode::Char('r')));
+        app.rename_tab_dialog
+            .as_mut()
+            .expect("rename dialog should open")
+            .title
+            .set_content("Users");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.rename_tab_dialog.is_none());
+        assert_eq!(app.active_tab().custom_title.as_deref(), Some("Users"));
+        assert_eq!(app.active_tab().title(app.active_request_tab), "Users");
+        assert_eq!(app.status_message, "Renamed request tab to: Users");
+    }
+
+    /// Escape closes the rename dialog without changing the tab title.
+    #[test]
+    fn rename_tab_dialog_escape_cancels() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut().custom_title = Some("Original".to_string());
+
+        app.handle_key(ctrl_key(KeyCode::Char('r')));
+        app.rename_tab_dialog
+            .as_mut()
+            .expect("rename dialog should open")
+            .title
+            .set_content("Changed");
+        app.handle_key(key(KeyCode::Esc));
+
+        assert!(app.rename_tab_dialog.is_none());
+        assert_eq!(app.active_tab().custom_title.as_deref(), Some("Original"));
+        assert_eq!(app.status_message, "Rename cancelled.");
+    }
+
+    /// Blank rename input clears the custom title and returns to derived titles.
+    #[test]
+    fn blank_rename_tab_dialog_resets_custom_title() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut().custom_title = Some("Users".to_string());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+
+        app.handle_key(ctrl_key(KeyCode::Char('r')));
+        app.rename_tab_dialog
+            .as_mut()
+            .expect("rename dialog should open")
+            .title
+            .set_content("   ");
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.active_tab().custom_title.is_none());
+        assert_eq!(
+            app.active_tab().title(app.active_request_tab),
+            "https://example.com/users"
+        );
+    }
+
     /// History navigation moves only through visible filtered requests.
     #[test]
     fn history_navigation_uses_filtered_requests() {
@@ -1519,7 +1901,9 @@ mod tests {
     #[test]
     fn save_current_request_adds_saved_request() {
         let mut app = app_with_history(Vec::new());
-        app.url.set_content("https://example.com/users");
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
 
         app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
 
@@ -1533,7 +1917,9 @@ mod tests {
     #[test]
     fn ctrl_p_opens_save_dialog() {
         let mut app = app_with_history(Vec::new());
-        app.url.set_content("https://example.com/users");
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
 
         app.handle_key(ctrl_key(KeyCode::Char('p')));
 
@@ -1547,7 +1933,9 @@ mod tests {
     #[test]
     fn save_dialog_saves_into_typed_collection_and_folder() {
         let mut app = app_with_history(Vec::new());
-        app.url.set_content("https://example.com/users");
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
 
         app.handle_key(ctrl_key(KeyCode::Char('p')));
         type_text(&mut app, "Identity");
@@ -1570,7 +1958,9 @@ mod tests {
     #[test]
     fn save_dialog_escape_cancels_save() {
         let mut app = app_with_history(Vec::new());
-        app.url.set_content("https://example.com/users");
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
 
         app.handle_key(ctrl_key(KeyCode::Char('p')));
         app.handle_key(key(KeyCode::Esc));
@@ -1591,7 +1981,9 @@ mod tests {
             Some("Users"),
         )]);
         app.saved_index = 0;
-        app.url.set_content("https://example.com/users/42");
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users/42");
 
         let (collection, folder) = app.selected_saved_context();
         app.save_current_request_to(collection, folder);
@@ -1619,8 +2011,8 @@ mod tests {
         app.load_from_saved_request();
 
         assert_eq!(app.current_method(), &HttpMethod::Post);
-        assert_eq!(app.url.content(), "https://example.com/orders");
-        assert_eq!(app.body.content(), "{\"status\":\"pending\"}");
+        assert_eq!(app.active_tab().url.content(), "https://example.com/orders");
+        assert_eq!(app.active_tab().body.content(), "{\"status\":\"pending\"}");
     }
 
     /// Environment cycling moves through loaded environments.
@@ -1648,9 +2040,13 @@ mod tests {
         let mut app = app_with_history(Vec::new());
         app.environments = vec![environment("Local", "http://localhost:8080")];
         app.environment_index = Some(0);
-        app.url.set_content("{{base_url}}/users");
-        app.headers.set_content("Authorization: Bearer {{token}}");
-        app.body.set_content("{\"source\":\"{{ base_url }}\"}");
+        app.active_tab_mut().url.set_content("{{base_url}}/users");
+        app.active_tab_mut()
+            .headers
+            .set_content("Authorization: Bearer {{token}}");
+        app.active_tab_mut()
+            .body
+            .set_content("{\"source\":\"{{ base_url }}\"}");
 
         app.send_request();
 
@@ -1658,16 +2054,16 @@ mod tests {
             .pending_request
             .as_ref()
             .expect("resolved request should be queued");
-        assert_eq!(request.url, "http://localhost:8080/users");
+        assert_eq!(request.request.url, "http://localhost:8080/users");
         assert_eq!(
-            request.headers,
+            request.request.headers,
             vec![("Authorization".to_string(), "Bearer abc123".to_string())]
         );
         assert_eq!(
-            request.body.as_deref(),
+            request.request.body.as_deref(),
             Some("{\"source\":\"http://localhost:8080\"}")
         );
-        assert_eq!(app.url.content(), "{{base_url}}/users");
+        assert_eq!(app.active_tab().url.content(), "{{base_url}}/users");
     }
 
     /// Missing variables prevent a request from being queued.
@@ -1676,7 +2072,9 @@ mod tests {
         let mut app = app_with_history(Vec::new());
         app.environments = vec![environment("Local", "http://localhost:8080")];
         app.environment_index = Some(0);
-        app.url.set_content("{{base_url}}/users/{{user_id}}");
+        app.active_tab_mut()
+            .url
+            .set_content("{{base_url}}/users/{{user_id}}");
 
         app.send_request();
 

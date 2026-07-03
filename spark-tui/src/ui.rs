@@ -165,8 +165,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Percentage(65),
+            Constraint::Min(6),
         ])
         .split(central_area);
 
@@ -457,21 +457,23 @@ fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
 
 /// Renders the request composer pane.
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    // Split composer: [environment] | [method + URL row] | [headers] | [body]
+    // Split composer: [environment] | [method + URL row] | [params] | [headers] | [body]
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Percentage(40),
-            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
         ])
         .split(area);
 
     render_environment_bar(frame, app, rows[0]);
     let method_area = render_method_url(frame, app, rows[1]);
-    render_headers(frame, app, rows[2]);
-    render_body(frame, app, rows[3]);
+    render_params(frame, app, rows[2]);
+    render_headers(frame, app, rows[3]);
+    render_body(frame, app, rows[4]);
     render_method_dropdown(frame, app, method_area);
 }
 
@@ -559,6 +561,30 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     }
 
     method_area
+}
+
+/// Renders the query params editor.
+fn render_params(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Params;
+    let block = Block::default()
+        .title(" Params  (key=value per line | # disables) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let active_tab = app.active_tab();
+    let params_text = active_tab.params.text();
+    let para = Paragraph::new(params_text.as_ref())
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(active_tab.params.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + cursor_offset(active_tab.params.cursor_row))
+            .min(area.y + area.height.saturating_sub(2));
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
 /// Renders the expanded HTTP method dropdown.
@@ -1875,6 +1901,7 @@ mod tests {
         let request = HttpRequest {
             method: HttpMethod::Get,
             url: "https://example.com".to_string(),
+            query_params: Vec::new(),
             headers: Vec::new(),
             body: None,
         };

@@ -457,7 +457,7 @@ fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
 
 /// Renders the request composer pane.
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    // Split composer: [environment] | [method + URL row] | [params + auth] | [headers] | [body]
+    // Split composer: [environment] | [method + URL row] | [params + auth] | [headers] | [body + scripts]
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -465,7 +465,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(0),
+            Constraint::Min(3),
         ])
         .split(area);
 
@@ -473,7 +473,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
     let method_area = render_method_url(frame, app, rows[1]);
     render_params_auth(frame, app, rows[2]);
     render_headers(frame, app, rows[3]);
-    render_body(frame, app, rows[4]);
+    render_body_scripts(frame, app, rows[4]);
     render_method_dropdown(frame, app, method_area);
 }
 
@@ -705,6 +705,76 @@ fn render_body(frame: &mut Frame, app: &App, area: Rect) {
         let cx = (area.x + 1 + cursor_offset(active_tab.body.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
         let cy = (area.y + 1 + cursor_offset(active_tab.body.cursor_row))
+            .min(area.y + area.height.saturating_sub(2));
+        frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Renders the request body and script editors in the lower composer area.
+fn render_body_scripts(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    render_body(frame, app, cols[0]);
+    render_scripts(frame, app, cols[1]);
+}
+
+/// Renders pre-request and response test script editors.
+fn render_scripts(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_pre_request_script(frame, app, cols[0]);
+    render_test_script(frame, app, cols[1]);
+}
+
+/// Renders the pre-request script editor.
+fn render_pre_request_script(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::PreRequestScript;
+    let block = Block::default()
+        .title(" Pre-request  (set/header/param) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let active_tab = app.active_tab();
+    let script_text = active_tab.pre_request_script.text();
+    let para = Paragraph::new(script_text.as_ref())
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(active_tab.pre_request_script.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + cursor_offset(active_tab.pre_request_script.cursor_row))
+            .min(area.y + area.height.saturating_sub(2));
+        frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Renders the response test script editor.
+fn render_test_script(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::TestScript;
+    let block = Block::default()
+        .title(" Tests  (status/header/body) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let active_tab = app.active_tab();
+    let script_text = active_tab.test_script.text();
+    let para = Paragraph::new(script_text.as_ref())
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(active_tab.test_script.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + cursor_offset(active_tab.test_script.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
@@ -1682,7 +1752,7 @@ mod tests {
     use spark_core::{
         config::Config,
         history::HistoryEntry,
-        http::{HttpMethod, HttpRequest, HttpResponse, RequestAuth},
+        http::{HttpMethod, HttpRequest, HttpResponse, RequestAuth, RequestScripts},
     };
 
     use crate::app::{App, ResponseTab};
@@ -1940,6 +2010,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            scripts: RequestScripts::default(),
         };
 
         response_code.map_or_else(

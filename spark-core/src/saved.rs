@@ -1,6 +1,6 @@
 //! Saved request persistence in JSON format.
 
-use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth};
+use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth, RequestScripts};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -39,6 +39,9 @@ pub struct SavedRequest {
     pub headers: Vec<(String, String)>,
     /// Request body, if any should be sent.
     pub body: Option<String>,
+    /// Pre-request and response test scripts.
+    #[serde(default)]
+    pub scripts: RequestScripts,
     /// UTC timestamp of when the saved request was last updated.
     pub updated_at: DateTime<Utc>,
 }
@@ -57,6 +60,7 @@ impl SavedRequest {
             auth: req.auth.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
+            scripts: req.scripts.clone(),
             updated_at: Utc::now(),
         }
     }
@@ -177,6 +181,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            scripts: RequestScripts::default(),
             updated_at: Utc::now(),
         }
     }

@@ -130,6 +130,17 @@ pub enum RequestAuth {
     },
 }
 
+/// Scripts attached to a request lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RequestScripts {
+    /// Script that runs before request templates are resolved and sent.
+    #[serde(default)]
+    pub pre_request: String,
+    /// Script that runs after a response is received.
+    #[serde(default)]
+    pub tests: String,
+}
+
 /// An outgoing HTTP request.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -145,6 +156,8 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     /// Optional request body.
     pub body: Option<String>,
+    /// Pre-request and response test scripts.
+    pub scripts: RequestScripts,
 }
 
 /// A parsed HTTP response returned by curl.
@@ -420,6 +433,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            scripts: RequestScripts::default(),
         };
 
         assert_eq!(
@@ -443,6 +457,7 @@ mod tests {
                 ("Accept".to_string(), "application/json".to_string()),
             ],
             body: None,
+            scripts: RequestScripts::default(),
         };
 
         assert_eq!(
@@ -467,6 +482,7 @@ mod tests {
             },
             headers: Vec::new(),
             body: None,
+            scripts: RequestScripts::default(),
         };
 
         assert_eq!(
@@ -492,6 +508,7 @@ mod tests {
             },
             headers: Vec::new(),
             body: None,
+            scripts: RequestScripts::default(),
         };
 
         assert_eq!(

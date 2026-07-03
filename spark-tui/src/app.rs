@@ -8,7 +8,10 @@ use spark_core::{
     config::Config,
     environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
-    http::{ApiKeyLocation, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth},
+    http::{
+        ApiKeyLocation, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth,
+        RequestScripts,
+    },
     saved::{
         DEFAULT_COLLECTION, SavedRequest, load_saved_requests, remove_saved_request,
         upsert_saved_request,
@@ -36,6 +39,10 @@ pub enum Focus {
     Headers,
     /// Body text area.
     Body,
+    /// Pre-request script editor.
+    PreRequestScript,
+    /// Response test script editor.
+    TestScript,
     /// Response viewer.
     Response,
 }
@@ -359,6 +366,10 @@ enum TextAreaTarget {
     Headers,
     /// Body editor.
     Body,
+    /// Pre-request script editor.
+    PreRequestScript,
+    /// Response test script editor.
+    TestScript,
 }
 
 /// Editable request workspace shown as one top-level tab.
@@ -378,6 +389,10 @@ pub struct RequestTab {
     pub headers: TextInput,
     /// Body editor for this tab.
     pub body: TextInput,
+    /// Pre-request script editor for this tab.
+    pub pre_request_script: TextInput,
+    /// Response test script editor for this tab.
+    pub test_script: TextInput,
     /// Most recent response for this tab.
     pub response: Option<HttpResponse>,
     /// Request that produced the most recent response for this tab.
@@ -399,6 +414,8 @@ impl RequestTab {
             auth: TextInput::multi_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
+            pre_request_script: TextInput::multi_line(),
+            test_script: TextInput::multi_line(),
             response: None,
             last_request: None,
             response_tab: ResponseTab::Body,
@@ -631,6 +648,10 @@ impl App {
             Focus::Auth => self.handle_text_area_key(key, TextAreaTarget::Auth),
             Focus::Headers => self.handle_text_area_key(key, TextAreaTarget::Headers),
             Focus::Body => self.handle_text_area_key(key, TextAreaTarget::Body),
+            Focus::PreRequestScript => {
+                self.handle_text_area_key(key, TextAreaTarget::PreRequestScript);
+            }
+            Focus::TestScript => self.handle_text_area_key(key, TextAreaTarget::TestScript),
             Focus::Response => self.handle_response_key(key),
         }
     }
@@ -690,7 +711,14 @@ impl App {
     fn focus_accepts_text(&self) -> bool {
         matches!(
             self.focus,
-            Focus::Search | Focus::Url | Focus::Params | Focus::Auth | Focus::Headers | Focus::Body
+            Focus::Search
+                | Focus::Url
+                | Focus::Params
+                | Focus::Auth
+                | Focus::Headers
+                | Focus::Body
+                | Focus::PreRequestScript
+                | Focus::TestScript
         )
     }
 
@@ -781,7 +809,9 @@ impl App {
             Focus::Params => Focus::Auth,
             Focus::Auth => Focus::Headers,
             Focus::Headers => Focus::Body,
-            Focus::Body => Focus::Response,
+            Focus::Body => Focus::PreRequestScript,
+            Focus::PreRequestScript => Focus::TestScript,
+            Focus::TestScript => Focus::Response,
             Focus::Response => Focus::History,
         };
     }
@@ -798,7 +828,9 @@ impl App {
             Focus::Auth => Focus::Params,
             Focus::Headers => Focus::Auth,
             Focus::Body => Focus::Headers,
-            Focus::Response => Focus::Body,
+            Focus::PreRequestScript => Focus::Body,
+            Focus::TestScript => Focus::PreRequestScript,
+            Focus::Response => Focus::TestScript,
         };
     }
 
@@ -932,6 +964,8 @@ impl App {
             TextAreaTarget::Auth => &mut self.active_tab_mut().auth,
             TextAreaTarget::Headers => &mut self.active_tab_mut().headers,
             TextAreaTarget::Body => &mut self.active_tab_mut().body,
+            TextAreaTarget::PreRequestScript => &mut self.active_tab_mut().pre_request_script,
+            TextAreaTarget::TestScript => &mut self.active_tab_mut().test_script,
         };
 
         match key.code {
@@ -1125,6 +1159,8 @@ impl App {
         let auth_text = format_auth(&entry.auth);
         let headers_text = format_headers(&entry.headers);
         let body_text = entry.body.clone().unwrap_or_default();
+        let pre_request_script = entry.scripts.pre_request.clone();
+        let test_script = entry.scripts.tests.clone();
 
         if let Some(idx) = HttpMethod::all().iter().position(|m| *m == method) {
             self.active_tab_mut().method_index = idx;
@@ -1135,6 +1171,10 @@ impl App {
         self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
+        self.active_tab_mut()
+            .pre_request_script
+            .set_content(&pre_request_script);
+        self.active_tab_mut().test_script.set_content(&test_script);
 
         self.method_dropdown_open = false;
         self.focus = Focus::Url;
@@ -1163,6 +1203,8 @@ impl App {
         let auth_text = format_auth(&request.auth);
         let headers_text = format_headers(&request.headers);
         let body_text = request.body.clone().unwrap_or_default();
+        let pre_request_script = request.scripts.pre_request.clone();
+        let test_script = request.scripts.tests.clone();
 
         if let Some(idx) = HttpMethod::all().iter().position(|m| *m == method) {
             self.active_tab_mut().method_index = idx;
@@ -1173,6 +1215,10 @@ impl App {
         self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
+        self.active_tab_mut()
+            .pre_request_script
+            .set_content(&pre_request_script);
+        self.active_tab_mut().test_script.set_content(&test_script);
 
         self.method_dropdown_open = false;
         self.focus = Focus::Url;
@@ -1372,11 +1418,24 @@ impl App {
 
     /// Queues the current request for execution after the sending state is rendered.
     pub fn send_request(&mut self) {
-        let Some(template) = self.current_template_request() else {
+        let Some(mut template) = self.current_template_request() else {
             self.status_message = "URL is empty — enter a URL and try again.".to_string();
             return;
         };
-        let request = match self.resolve_request_template(&template) {
+        let pre_request = match run_pre_request_script(
+            &template.scripts.pre_request,
+            self.active_environment(),
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                self.status_message = format!("Pre-request error: {e}");
+                return;
+            }
+        };
+        template.query_params.extend(pre_request.query_params);
+        template.headers.extend(pre_request.headers);
+        let environment = merged_environment(self.active_environment(), &pre_request.variables);
+        let request = match Self::resolve_request_template(&template, environment.as_ref()) {
             Ok(request) => request,
             Err(e) => {
                 self.status_message = format!("Environment error: {e}");
@@ -1403,10 +1462,9 @@ impl App {
             Ok(response) => {
                 let entry = HistoryEntry::from_response(&request, response.status_code);
                 let _ = append_history(&self.config.history_file, &entry);
-                self.status_message = format!(
-                    "✓ {} {}  —  {}",
-                    request.method, request.url, response.status_code
-                );
+                let test_results = run_test_script(&request.scripts.tests, &response);
+                self.status_message =
+                    request_status_message(&request, response.status_code, &test_results);
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
                 self.select_latest_visible_sidebar_item();
@@ -1443,6 +1501,8 @@ impl App {
         } else {
             Some(body_text.into_owned())
         };
+        let pre_request_script = tab.pre_request_script.text().into_owned();
+        let test_script = tab.test_script.text().into_owned();
 
         Some(HttpRequest {
             method,
@@ -1451,6 +1511,10 @@ impl App {
             auth,
             headers,
             body,
+            scripts: RequestScripts {
+                pre_request: pre_request_script,
+                tests: test_script,
+            },
         })
     }
 
@@ -1467,8 +1531,10 @@ impl App {
     }
 
     /// Resolves environment variables in a request template.
-    fn resolve_request_template(&self, request: &HttpRequest) -> Result<HttpRequest, String> {
-        let environment = self.active_environment();
+    fn resolve_request_template(
+        request: &HttpRequest,
+        environment: Option<&Environment>,
+    ) -> Result<HttpRequest, String> {
         let url = resolve_template(&request.url, environment).map_err(|e| e.to_string())?;
         let query_params = request
             .query_params
@@ -1507,6 +1573,7 @@ impl App {
             auth,
             headers,
             body,
+            scripts: request.scripts.clone(),
         })
     }
 
@@ -1649,6 +1716,267 @@ impl App {
         self.environment_index = Some(next);
         self.status_message = format!("Environment: {}", self.environments[next].name);
     }
+}
+
+/// Effects produced by a pre-request script.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PreRequestEffects {
+    /// Variables available to later pre-request lines and request templating.
+    variables: Vec<(String, String)>,
+    /// Headers appended to the outgoing request template.
+    headers: Vec<(String, String)>,
+    /// Query params appended to the outgoing request template.
+    query_params: Vec<QueryParam>,
+}
+
+/// One response test outcome.
+#[derive(Debug, PartialEq, Eq)]
+struct ScriptTestResult {
+    /// Human-readable assertion name.
+    name: String,
+    /// Whether the assertion passed.
+    passed: bool,
+    /// Failure detail for display and tests.
+    message: String,
+}
+
+/// Runs a pre-request script against an optional base environment.
+fn run_pre_request_script(
+    script: &str,
+    environment: Option<&Environment>,
+) -> Result<PreRequestEffects, String> {
+    let mut effects = PreRequestEffects::default();
+    for (line_index, line) in script.lines().enumerate() {
+        let line = line.trim();
+        if script_line_is_inactive(line) {
+            continue;
+        }
+        let (command, rest) = script_command(line);
+        match command {
+            "set" | "var" => {
+                let (key, value) = split_script_assignment(rest)
+                    .ok_or_else(|| script_line_error(line_index, "expected set name=value"))?;
+                let value = resolve_script_value(value, environment, &effects.variables)?;
+                effects.variables.push((key.to_string(), value));
+            }
+            "header" => {
+                let (key, value) = split_script_header(rest)
+                    .ok_or_else(|| script_line_error(line_index, "expected header Name: Value"))?;
+                let value = resolve_script_value(value, environment, &effects.variables)?;
+                effects.headers.push((key.to_string(), value));
+            }
+            "param" | "query" => {
+                let (key, value) = split_script_assignment(rest)
+                    .ok_or_else(|| script_line_error(line_index, "expected param name=value"))?;
+                let value = resolve_script_value(value, environment, &effects.variables)?;
+                effects
+                    .query_params
+                    .push(QueryParam::enabled(key.to_string(), value));
+            }
+            _ => return Err(script_line_error(line_index, "unknown pre-request command")),
+        }
+    }
+    Ok(effects)
+}
+
+/// Runs response tests and returns one result per active assertion line.
+fn run_test_script(script: &str, response: &HttpResponse) -> Vec<ScriptTestResult> {
+    script
+        .lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let line = line.trim();
+            (!script_line_is_inactive(line)).then(|| run_test_line(line_index, line, response))
+        })
+        .collect()
+}
+
+/// Runs one response test line.
+fn run_test_line(line_index: usize, line: &str, response: &HttpResponse) -> ScriptTestResult {
+    let (command, rest) = script_command(line);
+    match command {
+        "status" => test_status(line_index, rest, response.status_code),
+        "header" => test_header(line_index, rest, response),
+        "body" => test_body(line_index, rest, &response.body),
+        _ => ScriptTestResult {
+            name: format!("line {}", line_index + 1),
+            passed: false,
+            message: "unknown test command".to_string(),
+        },
+    }
+}
+
+/// Tests a response status assertion.
+fn test_status(line_index: usize, expected: &str, actual: u16) -> ScriptTestResult {
+    let expected = expected.trim();
+    let passed = status_matches(expected, actual);
+    ScriptTestResult {
+        name: format!("status {expected}"),
+        passed,
+        message: if passed {
+            "passed".to_string()
+        } else {
+            format!(
+                "line {} expected status {expected}, got {actual}",
+                line_index + 1
+            )
+        },
+    }
+}
+
+/// Tests a response header assertion.
+fn test_header(line_index: usize, rest: &str, response: &HttpResponse) -> ScriptTestResult {
+    let mut parts = rest.splitn(3, char::is_whitespace);
+    let name = parts.next().unwrap_or("").trim();
+    let operator = parts.next().unwrap_or("exists").trim();
+    let expected = parts.next().unwrap_or("").trim();
+    let actual = response
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+    let passed = match operator {
+        "exists" => actual.is_some(),
+        "contains" => actual.is_some_and(|value| value.contains(expected)),
+        "equals" | "is" => actual == Some(expected),
+        _ => false,
+    };
+    ScriptTestResult {
+        name: format!("header {name} {operator}"),
+        passed,
+        message: if passed {
+            "passed".to_string()
+        } else {
+            format!("line {} header assertion failed for {name}", line_index + 1)
+        },
+    }
+}
+
+/// Tests a response body assertion.
+fn test_body(line_index: usize, rest: &str, body: &str) -> ScriptTestResult {
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let operator = parts.next().unwrap_or("contains").trim();
+    let expected = parts.next().unwrap_or("").trim();
+    let passed = match operator {
+        "contains" => body.contains(expected),
+        "equals" | "is" => body == expected,
+        _ => false,
+    };
+    ScriptTestResult {
+        name: format!("body {operator}"),
+        passed,
+        message: if passed {
+            "passed".to_string()
+        } else {
+            format!("line {} body assertion failed", line_index + 1)
+        },
+    }
+}
+
+/// Returns the status bar message for a completed request and its tests.
+fn request_status_message(
+    request: &HttpRequest,
+    response_code: u16,
+    tests: &[ScriptTestResult],
+) -> String {
+    let base = format!("✓ {} {}  —  {}", request.method, request.url, response_code);
+    if tests.is_empty() {
+        return base;
+    }
+
+    let passed = tests.iter().filter(|test| test.passed).count();
+    let total = tests.len();
+    if passed == total {
+        format!("{base}  —  tests {passed}/{total} passed")
+    } else {
+        let first_failure = tests
+            .iter()
+            .find(|test| !test.passed)
+            .map_or("test failed", |test| test.message.as_str());
+        format!("{base}  —  tests {passed}/{total} passed: {first_failure}")
+    }
+}
+
+/// Returns whether a script line should be skipped.
+fn script_line_is_inactive(line: &str) -> bool {
+    line.is_empty() || line.starts_with('#') || line.starts_with("//")
+}
+
+/// Splits the first command token from the rest of a script line.
+fn script_command(line: &str) -> (&str, &str) {
+    line.split_once(char::is_whitespace)
+        .map_or((line, ""), |(command, rest)| (command.trim(), rest.trim()))
+}
+
+/// Splits `name=value` script syntax and rejects empty names.
+fn split_script_assignment(text: &str) -> Option<(&str, &str)> {
+    let (key, value) = text.split_once('=')?;
+    let key = key.trim();
+    (!key.is_empty()).then_some((key, value.trim()))
+}
+
+/// Splits `Name: Value` or `Name=Value` header syntax.
+fn split_script_header(text: &str) -> Option<(&str, &str)> {
+    text.split_once(':')
+        .or_else(|| text.split_once('='))
+        .and_then(|(key, value)| {
+            let key = key.trim();
+            (!key.is_empty()).then_some((key, value.trim()))
+        })
+}
+
+/// Resolves a pre-request script value against script and base environment variables.
+fn resolve_script_value(
+    value: &str,
+    environment: Option<&Environment>,
+    variables: &[(String, String)],
+) -> Result<String, String> {
+    let merged = merged_environment(environment, variables);
+    resolve_template(value, merged.as_ref()).map_err(|e| e.to_string())
+}
+
+/// Returns an environment with script variables taking precedence over base variables.
+fn merged_environment(
+    environment: Option<&Environment>,
+    variables: &[(String, String)],
+) -> Option<Environment> {
+    if variables.is_empty() {
+        return environment.cloned();
+    }
+
+    let mut merged = variables.to_vec();
+    if let Some(environment) = environment {
+        merged.extend(environment.variables.clone());
+    }
+    Some(Environment {
+        name: "Script".to_string(),
+        variables: merged,
+    })
+}
+
+/// Returns whether a status assertion matches the actual status code.
+fn status_matches(expected: &str, actual: u16) -> bool {
+    let expected = expected.trim();
+    if let Some(prefix) = expected.strip_suffix("xx") {
+        return prefix
+            .parse::<u16>()
+            .is_ok_and(|hundreds| actual / 100 == hundreds);
+    }
+    if let Some((start, end)) = expected.split_once("..") {
+        let Ok(start) = start.trim().parse::<u16>() else {
+            return false;
+        };
+        let Ok(end) = end.trim().parse::<u16>() else {
+            return false;
+        };
+        return (start..=end).contains(&actual);
+    }
+    expected.parse::<u16>() == Ok(actual)
+}
+
+/// Formats a one-based script line error.
+fn script_line_error(line_index: usize, message: &str) -> String {
+    format!("line {} {message}", line_index + 1)
 }
 
 /// Parses raw header text (`Key: Value` per line) into key-value pairs.
@@ -1883,6 +2211,7 @@ fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
         || check_query_params(&entry.query_params, query)
         || check_auth(&entry.auth, query)
         || check_headers(&entry.headers, query)
+        || check_scripts(&entry.scripts, query)
         || entry
             .body
             .as_deref()
@@ -1951,10 +2280,17 @@ fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
         || check_query_params(&request.query_params, query)
         || check_auth(&request.auth, query)
         || check_headers(&request.headers, query)
+        || check_scripts(&request.scripts, query)
         || request
             .body
             .as_deref()
             .is_some_and(|body| contains_case_insensitive(body, query))
+}
+
+/// Checks request scripts for a case-insensitive search match.
+fn check_scripts(scripts: &RequestScripts, query: &str) -> bool {
+    contains_case_insensitive(&scripts.pre_request, query)
+        || contains_case_insensitive(&scripts.tests, query)
 }
 
 /// Returns a slash-separated collection/folder label for a saved request.
@@ -2047,6 +2383,7 @@ mod tests {
             auth: RequestAuth::None,
             headers,
             body: body.map(ToString::to_string),
+            scripts: RequestScripts::default(),
         })
     }
 
@@ -2064,6 +2401,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: body.map(ToString::to_string),
+            scripts: RequestScripts::default(),
         };
         let mut saved = SavedRequest::from_request(&request);
         saved.name = name.to_string();
@@ -2759,6 +3097,10 @@ mod tests {
         app.active_tab_mut()
             .auth
             .set_content("bearer token={{token}}");
+        app.active_tab_mut()
+            .pre_request_script
+            .set_content("set user_id=42");
+        app.active_tab_mut().test_script.set_content("status 2xx");
 
         app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
 
@@ -2782,6 +3124,8 @@ mod tests {
                 token: "{{token}}".to_string(),
             }
         );
+        assert_eq!(app.saved_requests[0].scripts.pre_request, "set user_id=42");
+        assert_eq!(app.saved_requests[0].scripts.tests, "status 2xx");
         let _ = std::fs::remove_file(&app.config.saved_requests_file);
     }
 
@@ -2886,6 +3230,10 @@ mod tests {
         saved.auth = RequestAuth::Bearer {
             token: "{{token}}".to_string(),
         };
+        saved.scripts = RequestScripts {
+            pre_request: "set order_id=42".to_string(),
+            tests: "status 200".to_string(),
+        };
         let mut app = app_with_saved_requests(vec![saved]);
 
         app.load_from_saved_request();
@@ -2895,6 +3243,11 @@ mod tests {
         assert_eq!(app.active_tab().params.content(), "status=pending");
         assert_eq!(app.active_tab().auth.content(), "bearer token={{token}}");
         assert_eq!(app.active_tab().body.content(), "{\"status\":\"pending\"}");
+        assert_eq!(
+            app.active_tab().pre_request_script.content(),
+            "set order_id=42"
+        );
+        assert_eq!(app.active_tab().test_script.content(), "status 200");
     }
 
     /// Environment cycling moves through loaded environments.
@@ -2968,6 +3321,56 @@ mod tests {
             request.request.url_with_query_params(),
             "https://example.com/search?q=ada%20lovelace&api_key=abc123"
         );
+    }
+
+    /// Pre-request scripts can add variables, headers, and query params before send.
+    #[test]
+    fn send_request_applies_pre_request_script_before_resolution() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.active_tab_mut()
+            .url
+            .set_content("{{base_url}}/users/{{user_id}}");
+        app.active_tab_mut()
+            .pre_request_script
+            .set_content("set user_id=42\nheader X-Trace: {{user_id}}\nparam debug=true");
+
+        app.send_request();
+
+        let request = app
+            .pending_request
+            .as_ref()
+            .expect("resolved request should be queued");
+        assert_eq!(request.request.url, "http://localhost:8080/users/42");
+        assert_eq!(
+            request.request.headers,
+            vec![("X-Trace".to_string(), "42".to_string())]
+        );
+        assert_eq!(
+            request.request.query_params,
+            vec![QueryParam::enabled("debug".to_string(), "true".to_string())]
+        );
+    }
+
+    /// Response test scripts report individual assertion results.
+    #[test]
+    fn response_test_script_checks_status_headers_and_body() {
+        let response = HttpResponse {
+            status_code: 201,
+            status_text: "Created".to_string(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: "{\"name\":\"Ada\"}".to_string(),
+            duration_ms: 25,
+        };
+
+        let results = run_test_script(
+            "status 2xx\nheader Content-Type contains json\nbody contains Ada",
+            &response,
+        );
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|result| result.passed));
     }
 
     /// Sending resolves variables without mutating the composer template.

@@ -457,7 +457,7 @@ fn saved_request_list_item(request: &SavedRequest) -> ListItem<'_> {
 
 /// Renders the request composer pane.
 fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
-    // Split composer: [environment] | [method + URL row] | [params] | [headers] | [body]
+    // Split composer: [environment] | [method + URL row] | [params + auth] | [headers] | [body]
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -471,7 +471,7 @@ fn render_composer(frame: &mut Frame, app: &App, area: Rect) {
 
     render_environment_bar(frame, app, rows[0]);
     let method_area = render_method_url(frame, app, rows[1]);
-    render_params(frame, app, rows[2]);
+    render_params_auth(frame, app, rows[2]);
     render_headers(frame, app, rows[3]);
     render_body(frame, app, rows[4]);
     render_method_dropdown(frame, app, method_area);
@@ -563,6 +563,17 @@ fn render_method_url(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     method_area
 }
 
+/// Renders query params and auth helper editors in one compact row.
+fn render_params_auth(frame: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_params(frame, app, cols[0]);
+    render_auth(frame, app, cols[1]);
+}
+
 /// Renders the query params editor.
 fn render_params(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Params;
@@ -582,6 +593,30 @@ fn render_params(frame: &mut Frame, app: &App, area: Rect) {
         let cx = (area.x + 1 + cursor_offset(active_tab.params.cursor_col))
             .min(area.x + area.width.saturating_sub(2));
         let cy = (area.y + 1 + cursor_offset(active_tab.params.cursor_row))
+            .min(area.y + area.height.saturating_sub(2));
+        frame.set_cursor_position((cx, cy));
+    }
+}
+
+/// Renders the authentication helper editor.
+fn render_auth(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Auth;
+    let block = Block::default()
+        .title(" Auth  (bearer/basic/api-key-header/query) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+
+    let active_tab = app.active_tab();
+    let auth_text = active_tab.auth.text();
+    let para = Paragraph::new(auth_text.as_ref())
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(active_tab.auth.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + cursor_offset(active_tab.auth.cursor_row))
             .min(area.y + area.height.saturating_sub(2));
         frame.set_cursor_position((cx, cy));
     }
@@ -1647,7 +1682,7 @@ mod tests {
     use spark_core::{
         config::Config,
         history::HistoryEntry,
-        http::{HttpMethod, HttpRequest, HttpResponse},
+        http::{HttpMethod, HttpRequest, HttpResponse, RequestAuth},
     };
 
     use crate::app::{App, ResponseTab};
@@ -1902,6 +1937,7 @@ mod tests {
             method: HttpMethod::Get,
             url: "https://example.com".to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
         };

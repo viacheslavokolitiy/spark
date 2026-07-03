@@ -1,6 +1,6 @@
 //! Request history persistence in JSONL (newline-delimited JSON) format.
 
-use crate::http::{HttpMethod, HttpRequest, QueryParam};
+use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -23,6 +23,9 @@ pub struct HistoryEntry {
     /// Query string parameters that were attached to the URL.
     #[serde(default)]
     pub query_params: Vec<QueryParam>,
+    /// Authentication helper used by the request.
+    #[serde(default)]
+    pub auth: RequestAuth,
     /// Headers that were sent.
     pub headers: Vec<(String, String)>,
     /// Request body, if any was sent.
@@ -42,6 +45,7 @@ impl HistoryEntry {
             method: req.method,
             url: req.url.clone(),
             query_params: req.query_params.clone(),
+            auth: req.auth.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
             response_code: None,
@@ -184,6 +188,7 @@ mod tests {
             method: HttpMethod::Get,
             url: "https://example.com".to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
         };

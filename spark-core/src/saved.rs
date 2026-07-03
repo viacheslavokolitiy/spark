@@ -1,6 +1,6 @@
 //! Saved request persistence in JSON format.
 
-use crate::http::{HttpMethod, HttpRequest, QueryParam};
+use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -32,6 +32,9 @@ pub struct SavedRequest {
     /// Query string parameters attached to the URL.
     #[serde(default)]
     pub query_params: Vec<QueryParam>,
+    /// Authentication helper attached to the request.
+    #[serde(default)]
+    pub auth: RequestAuth,
     /// Headers that should be sent.
     pub headers: Vec<(String, String)>,
     /// Request body, if any should be sent.
@@ -51,6 +54,7 @@ impl SavedRequest {
             method: req.method,
             url: req.url.clone(),
             query_params: req.query_params.clone(),
+            auth: req.auth.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
             updated_at: Utc::now(),
@@ -170,6 +174,7 @@ mod tests {
             method: HttpMethod::Get,
             url: url.to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
             updated_at: Utc::now(),

@@ -92,6 +92,44 @@ const fn default_enabled() -> bool {
     true
 }
 
+/// Where an API key auth helper should inject the credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApiKeyLocation {
+    /// Add the API key as a request header.
+    Header,
+    /// Add the API key as a query string parameter.
+    Query,
+}
+
+/// Authentication helper attached to an outgoing request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RequestAuth {
+    /// Do not add any authentication material.
+    #[default]
+    None,
+    /// Add `Authorization: Bearer <token>`.
+    Bearer {
+        /// Bearer token value.
+        token: String,
+    },
+    /// Add an HTTP Basic `Authorization` header.
+    Basic {
+        /// Basic auth username.
+        username: String,
+        /// Basic auth password.
+        password: String,
+    },
+    /// Add an API key as either a header or query parameter.
+    ApiKey {
+        /// Header or query parameter name.
+        key: String,
+        /// API key value.
+        value: String,
+        /// Credential injection target.
+        location: ApiKeyLocation,
+    },
+}
+
 /// An outgoing HTTP request.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -101,6 +139,8 @@ pub struct HttpRequest {
     pub url: String,
     /// Query string parameters appended to the target URL when enabled.
     pub query_params: Vec<QueryParam>,
+    /// Authentication helper applied at send time.
+    pub auth: RequestAuth,
     /// Request headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
     /// Optional request body.
@@ -138,7 +178,7 @@ impl HttpRequest {
             .arg(self.method.as_str())
             .arg(self.url_with_query_params());
 
-        for (key, value) in &self.headers {
+        for (key, value) in self.headers_with_auth() {
             cmd.arg("-H").arg(format!("{key}: {value}"));
         }
 
@@ -165,8 +205,100 @@ impl HttpRequest {
     /// Returns the target URL with enabled query params appended.
     #[must_use]
     pub fn url_with_query_params(&self) -> String {
-        append_query_params(&self.url, &self.query_params)
+        let mut params = self.query_params.clone();
+        params.extend(self.auth_query_params());
+        append_query_params(&self.url, &params)
     }
+
+    /// Returns request headers with auth helper output applied.
+    #[must_use]
+    pub fn headers_with_auth(&self) -> Vec<(String, String)> {
+        let Some((auth_key, auth_value)) = self.auth_header() else {
+            return self.headers.clone();
+        };
+
+        let mut headers = self
+            .headers
+            .iter()
+            .filter(|(key, _)| !key.eq_ignore_ascii_case(&auth_key))
+            .cloned()
+            .collect::<Vec<_>>();
+        headers.push((auth_key, auth_value));
+        headers
+    }
+
+    /// Returns the auth-generated header, if any.
+    fn auth_header(&self) -> Option<(String, String)> {
+        match &self.auth {
+            RequestAuth::Bearer { token } if !token.trim().is_empty() => Some((
+                "Authorization".to_string(),
+                format!("Bearer {}", token.trim()),
+            )),
+            RequestAuth::Basic { username, password } if !username.trim().is_empty() => Some((
+                "Authorization".to_string(),
+                format!(
+                    "Basic {}",
+                    base64_encode(format!("{}:{password}", username.trim()).as_bytes())
+                ),
+            )),
+            RequestAuth::ApiKey {
+                key,
+                value,
+                location: ApiKeyLocation::Header,
+            } if !key.trim().is_empty() => Some((key.trim().to_string(), value.trim().to_string())),
+            _ => None,
+        }
+    }
+
+    /// Returns the auth-generated query params, if any.
+    fn auth_query_params(&self) -> Vec<QueryParam> {
+        match &self.auth {
+            RequestAuth::ApiKey {
+                key,
+                value,
+                location: ApiKeyLocation::Query,
+            } if !key.trim().is_empty() => {
+                vec![QueryParam::enabled(
+                    key.trim().to_string(),
+                    value.trim().to_string(),
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Base64 alphabet for HTTP Basic credentials.
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encodes bytes using standard Base64 with padding.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+
+        output.push(char::from(BASE64[usize::from(first >> 2)]));
+        output.push(char::from(
+            BASE64[usize::from(((first & 0b0000_0011) << 4) | (second >> 4))],
+        ));
+
+        if chunk.len() > 1 {
+            output.push(char::from(
+                BASE64[usize::from(((second & 0b0000_1111) << 2) | (third >> 6))],
+            ));
+        } else {
+            output.push('=');
+        }
+
+        if chunk.len() > 2 {
+            output.push(char::from(BASE64[usize::from(third & 0b0011_1111)]));
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 /// Appends enabled query params to `url`, preserving existing query strings.
@@ -285,6 +417,7 @@ mod tests {
                 },
                 QueryParam::enabled(String::new(), "skipped".to_string()),
             ],
+            auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
         };
@@ -292,6 +425,78 @@ mod tests {
         assert_eq!(
             request.url_with_query_params(),
             "https://example.com/search?existing=true&q=ada%20lovelace"
+        );
+    }
+
+    /// Bearer auth replaces an existing Authorization header.
+    #[test]
+    fn headers_with_auth_applies_bearer_token() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com".to_string(),
+            query_params: Vec::new(),
+            auth: RequestAuth::Bearer {
+                token: "abc123".to_string(),
+            },
+            headers: vec![
+                ("Authorization".to_string(), "old".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ],
+            body: None,
+        };
+
+        assert_eq!(
+            request.headers_with_auth(),
+            vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("Authorization".to_string(), "Bearer abc123".to_string()),
+            ]
+        );
+    }
+
+    /// Basic auth encodes username and password into an Authorization header.
+    #[test]
+    fn headers_with_auth_applies_basic_auth() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com".to_string(),
+            query_params: Vec::new(),
+            auth: RequestAuth::Basic {
+                username: "ada".to_string(),
+                password: "secret".to_string(),
+            },
+            headers: Vec::new(),
+            body: None,
+        };
+
+        assert_eq!(
+            request.headers_with_auth(),
+            vec![(
+                "Authorization".to_string(),
+                "Basic YWRhOnNlY3JldA==".to_string()
+            )]
+        );
+    }
+
+    /// API key auth can append a query parameter.
+    #[test]
+    fn url_with_query_params_applies_api_key_query_auth() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com/search".to_string(),
+            query_params: Vec::new(),
+            auth: RequestAuth::ApiKey {
+                key: "api_key".to_string(),
+                value: "abc 123".to_string(),
+                location: ApiKeyLocation::Query,
+            },
+            headers: Vec::new(),
+            body: None,
+        };
+
+        assert_eq!(
+            request.url_with_query_params(),
+            "https://example.com/search?api_key=abc%20123"
         );
     }
 }

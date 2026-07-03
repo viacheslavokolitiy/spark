@@ -1,7 +1,7 @@
 //! Import and export for saved request collections.
 
 use crate::{
-    http::{HttpMethod, QueryParam},
+    http::{ApiKeyLocation, HttpMethod, QueryParam, RequestAuth},
     saved::{DEFAULT_COLLECTION, SavedRequest, write_saved_requests},
 };
 use anyhow::{Context, anyhow};
@@ -188,6 +188,7 @@ fn collect_postman_items(
                     .collect::<Vec<_>>()
             });
         let query_params = postman_query_params(request_value.get("url"));
+        let auth = postman_auth(request_value.get("auth"));
         let body = request_value
             .pointer("/body/raw")
             .and_then(Value::as_str)
@@ -201,11 +202,61 @@ fn collect_postman_items(
             method,
             url,
             query_params,
+            auth,
             headers,
             body,
             updated_at: Utc::now(),
         });
     }
+}
+
+/// Extracts a supported auth helper from a Postman auth object.
+fn postman_auth(value: Option<&Value>) -> RequestAuth {
+    let Some(auth) = value.and_then(Value::as_object) else {
+        return RequestAuth::None;
+    };
+    match auth.get("type").and_then(Value::as_str) {
+        Some("bearer") => postman_auth_attr(auth, "bearer", "token")
+            .map_or(RequestAuth::None, |token| RequestAuth::Bearer { token }),
+        Some("basic") => {
+            let username = postman_auth_attr(auth, "basic", "username").unwrap_or_default();
+            let password = postman_auth_attr(auth, "basic", "password").unwrap_or_default();
+            if username.is_empty() {
+                RequestAuth::None
+            } else {
+                RequestAuth::Basic { username, password }
+            }
+        }
+        Some("apikey") => {
+            let key = postman_auth_attr(auth, "apikey", "key").unwrap_or_default();
+            let value = postman_auth_attr(auth, "apikey", "value").unwrap_or_default();
+            let location = match postman_auth_attr(auth, "apikey", "in").as_deref() {
+                Some("query") => ApiKeyLocation::Query,
+                _ => ApiKeyLocation::Header,
+            };
+            if key.is_empty() {
+                RequestAuth::None
+            } else {
+                RequestAuth::ApiKey {
+                    key,
+                    value,
+                    location,
+                }
+            }
+        }
+        _ => RequestAuth::None,
+    }
+}
+
+/// Reads one keyed Postman auth attribute from an auth array.
+fn postman_auth_attr(auth: &Map<String, Value>, section: &str, key: &str) -> Option<String> {
+    auth.get(section)
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|entry| entry.get("key").and_then(Value::as_str) == Some(key))
+        .and_then(|entry| entry.get("value"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 /// Parses a Postman header entry.
@@ -312,6 +363,7 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
                 method,
                 url: format!("{base_url}{path}"),
                 query_params,
+                auth: RequestAuth::None,
                 headers,
                 body,
                 updated_at: Utc::now(),
@@ -456,11 +508,51 @@ fn postman_request_item(request: &SavedRequest) -> Value {
                 .collect::<Vec<_>>()
         );
     }
+    if let Some(auth) = postman_auth_value(&request.auth) {
+        request_value["auth"] = auth;
+    }
 
     json!({
         "name": request.name,
         "request": request_value,
     })
+}
+
+/// Converts a Spark auth helper into a Postman auth object.
+fn postman_auth_value(auth: &RequestAuth) -> Option<Value> {
+    match auth {
+        RequestAuth::None => None,
+        RequestAuth::Bearer { token } => Some(json!({
+            "type": "bearer",
+            "bearer": [{"key": "token", "value": token, "type": "string"}],
+        })),
+        RequestAuth::Basic { username, password } => Some(json!({
+            "type": "basic",
+            "basic": [
+                {"key": "username", "value": username, "type": "string"},
+                {"key": "password", "value": password, "type": "string"}
+            ],
+        })),
+        RequestAuth::ApiKey {
+            key,
+            value,
+            location,
+        } => Some(json!({
+            "type": "apikey",
+            "apikey": [
+                {"key": "key", "value": key, "type": "string"},
+                {"key": "value", "value": value, "type": "string"},
+                {
+                    "key": "in",
+                    "value": match location {
+                        ApiKeyLocation::Header => "header",
+                        ApiKeyLocation::Query => "query",
+                    },
+                    "type": "string"
+                }
+            ],
+        })),
+    }
 }
 
 /// Exports requests as an `OpenAPI` 3.1 value.
@@ -598,6 +690,7 @@ mod tests {
             method,
             url: url.to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
             body: Some("{\"name\":\"Ada\"}".to_string()),
             updated_at: Utc::now(),
@@ -616,6 +709,10 @@ mod tests {
               "request": {
                 "method": "POST",
                 "header": [{"key":"Content-Type","value":"application/json"}],
+                "auth": {
+                  "type": "bearer",
+                  "bearer": [{"key":"token","value":"{{token}}","type":"string"}]
+                },
                 "url": {
                   "raw":"https://api.example.com/users",
                   "query": [
@@ -646,6 +743,12 @@ mod tests {
                     value: "false".to_string(),
                 },
             ]
+        );
+        assert_eq!(
+            imported[0].auth,
+            RequestAuth::Bearer {
+                token: "{{token}}".to_string(),
+            }
         );
     }
 
@@ -699,6 +802,10 @@ mod tests {
             "active".to_string(),
             "true".to_string(),
         )];
+        request.auth = RequestAuth::Basic {
+            username: "ada".to_string(),
+            password: "secret".to_string(),
+        };
         let exported = export_postman(&[request]);
 
         assert_eq!(
@@ -716,6 +823,12 @@ mod tests {
                 .pointer("/item/0/item/0/item/0/request/url/query/0/key")
                 .and_then(Value::as_str),
             Some("active")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/request/auth/type")
+                .and_then(Value::as_str),
+            Some("basic")
         );
     }
 

@@ -8,7 +8,7 @@ use spark_core::{
     config::Config,
     environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
-    http::{HttpMethod, HttpRequest, HttpResponse, QueryParam},
+    http::{ApiKeyLocation, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth},
     saved::{
         DEFAULT_COLLECTION, SavedRequest, load_saved_requests, remove_saved_request,
         upsert_saved_request,
@@ -30,6 +30,8 @@ pub enum Focus {
     Url,
     /// Query parameter editor.
     Params,
+    /// Authentication helper editor.
+    Auth,
     /// Headers text area.
     Headers,
     /// Body text area.
@@ -351,6 +353,8 @@ impl RenameTabDialog {
 enum TextAreaTarget {
     /// Query params editor.
     Params,
+    /// Authentication helper editor.
+    Auth,
     /// Headers editor.
     Headers,
     /// Body editor.
@@ -368,6 +372,8 @@ pub struct RequestTab {
     pub url: TextInput,
     /// Query parameter editor for this tab.
     pub params: TextInput,
+    /// Authentication helper editor for this tab.
+    pub auth: TextInput,
     /// Header editor for this tab.
     pub headers: TextInput,
     /// Body editor for this tab.
@@ -390,6 +396,7 @@ impl RequestTab {
             method_index: 0,
             url: TextInput::single_line(),
             params: TextInput::multi_line(),
+            auth: TextInput::multi_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
             response: None,
@@ -621,6 +628,7 @@ impl App {
             Focus::Method => self.handle_method_key(key),
             Focus::Url => self.handle_url_key(key),
             Focus::Params => self.handle_text_area_key(key, TextAreaTarget::Params),
+            Focus::Auth => self.handle_text_area_key(key, TextAreaTarget::Auth),
             Focus::Headers => self.handle_text_area_key(key, TextAreaTarget::Headers),
             Focus::Body => self.handle_text_area_key(key, TextAreaTarget::Body),
             Focus::Response => self.handle_response_key(key),
@@ -682,7 +690,7 @@ impl App {
     fn focus_accepts_text(&self) -> bool {
         matches!(
             self.focus,
-            Focus::Search | Focus::Url | Focus::Params | Focus::Headers | Focus::Body
+            Focus::Search | Focus::Url | Focus::Params | Focus::Auth | Focus::Headers | Focus::Body
         )
     }
 
@@ -770,7 +778,8 @@ impl App {
             Focus::Search => Focus::Method,
             Focus::Method => Focus::Url,
             Focus::Url => Focus::Params,
-            Focus::Params => Focus::Headers,
+            Focus::Params => Focus::Auth,
+            Focus::Auth => Focus::Headers,
             Focus::Headers => Focus::Body,
             Focus::Body => Focus::Response,
             Focus::Response => Focus::History,
@@ -786,7 +795,8 @@ impl App {
             Focus::Method => Focus::Search,
             Focus::Url => Focus::Method,
             Focus::Params => Focus::Url,
-            Focus::Headers => Focus::Params,
+            Focus::Auth => Focus::Params,
+            Focus::Headers => Focus::Auth,
             Focus::Body => Focus::Headers,
             Focus::Response => Focus::Body,
         };
@@ -919,6 +929,7 @@ impl App {
 
         let area = match target {
             TextAreaTarget::Params => &mut self.active_tab_mut().params,
+            TextAreaTarget::Auth => &mut self.active_tab_mut().auth,
             TextAreaTarget::Headers => &mut self.active_tab_mut().headers,
             TextAreaTarget::Body => &mut self.active_tab_mut().body,
         };
@@ -1111,6 +1122,7 @@ impl App {
         let method = entry.method;
         let url = entry.url.clone();
         let params_text = format_query_params(&entry.query_params);
+        let auth_text = format_auth(&entry.auth);
         let headers_text = format_headers(&entry.headers);
         let body_text = entry.body.clone().unwrap_or_default();
 
@@ -1120,6 +1132,7 @@ impl App {
 
         self.active_tab_mut().url.set_content(&url);
         self.active_tab_mut().params.set_content(&params_text);
+        self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
 
@@ -1147,6 +1160,7 @@ impl App {
         let url = request.url.clone();
         let name = request.name.clone();
         let params_text = format_query_params(&request.query_params);
+        let auth_text = format_auth(&request.auth);
         let headers_text = format_headers(&request.headers);
         let body_text = request.body.clone().unwrap_or_default();
 
@@ -1156,6 +1170,7 @@ impl App {
 
         self.active_tab_mut().url.set_content(&url);
         self.active_tab_mut().params.set_content(&params_text);
+        self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
 
@@ -1418,6 +1433,8 @@ impl App {
         let method = *self.current_method();
         let params_text = tab.params.text();
         let query_params = parse_query_params(params_text.as_ref());
+        let auth_text = tab.auth.text();
+        let auth = parse_auth(auth_text.as_ref());
         let headers_text = tab.headers.text();
         let headers = parse_headers(headers_text.as_ref());
         let body_text = tab.body.text();
@@ -1431,6 +1448,7 @@ impl App {
             method,
             url: url.to_string(),
             query_params,
+            auth,
             headers,
             body,
         })
@@ -1466,6 +1484,7 @@ impl App {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let auth = resolve_auth_template(&request.auth, environment)?;
         let headers = request
             .headers
             .iter()
@@ -1485,6 +1504,7 @@ impl App {
             method: request.method,
             url,
             query_params,
+            auth,
             headers,
             body,
         })
@@ -1714,6 +1734,130 @@ fn format_query_params(params: &[QueryParam]) -> String {
         .join("\n")
 }
 
+/// Parses auth helper text into a request auth value.
+fn parse_auth(text: &str) -> RequestAuth {
+    let Some(mode) = auth_mode(text) else {
+        return RequestAuth::None;
+    };
+    let fields = auth_fields(text);
+
+    match mode.as_str() {
+        "bearer" => fields
+            .get("token")
+            .filter(|token| !token.trim().is_empty())
+            .map_or(RequestAuth::None, |token| RequestAuth::Bearer {
+                token: token.trim().to_string(),
+            }),
+        "basic" => {
+            let username = fields.get("username").map_or("", String::as_str).trim();
+            let password = fields.get("password").map_or("", String::as_str).trim();
+            if username.is_empty() {
+                RequestAuth::None
+            } else {
+                RequestAuth::Basic {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                }
+            }
+        }
+        "api-key-header" | "apikey-header" => parse_api_key_auth(&fields, ApiKeyLocation::Header),
+        "api-key-query" | "apikey-query" => parse_api_key_auth(&fields, ApiKeyLocation::Query),
+        _ => RequestAuth::None,
+    }
+}
+
+/// Parses API key auth from keyed auth editor fields.
+fn parse_api_key_auth(
+    fields: &std::collections::BTreeMap<String, String>,
+    location: ApiKeyLocation,
+) -> RequestAuth {
+    let key = fields.get("key").map_or("", String::as_str).trim();
+    let value = fields.get("value").map_or("", String::as_str).trim();
+    if key.is_empty() {
+        RequestAuth::None
+    } else {
+        RequestAuth::ApiKey {
+            key: key.to_string(),
+            value: value.to_string(),
+            location,
+        }
+    }
+}
+
+/// Returns the lowercased auth mode from editor text.
+fn auth_mode(text: &str) -> Option<String> {
+    text.lines()
+        .flat_map(str::split_whitespace)
+        .find(|token| !token.contains('='))
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .map(str::to_lowercase)
+}
+
+/// Returns key-value fields from auth editor text.
+fn auth_fields(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut fields = std::collections::BTreeMap::new();
+    for token in text.lines().flat_map(str::split_whitespace) {
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        fields.insert(key, value.trim().to_string());
+    }
+    fields
+}
+
+/// Formats an auth helper for the auth editor.
+fn format_auth(auth: &RequestAuth) -> String {
+    match auth {
+        RequestAuth::None => String::new(),
+        RequestAuth::Bearer { token } => format!("bearer token={token}"),
+        RequestAuth::Basic { username, password } => {
+            format!("basic username={username} password={password}")
+        }
+        RequestAuth::ApiKey {
+            key,
+            value,
+            location,
+        } => {
+            let mode = match location {
+                ApiKeyLocation::Header => "api-key-header",
+                ApiKeyLocation::Query => "api-key-query",
+            };
+            format!("{mode} key={key} value={value}")
+        }
+    }
+}
+
+/// Resolves auth helper templates using the active environment.
+fn resolve_auth_template(
+    auth: &RequestAuth,
+    environment: Option<&Environment>,
+) -> Result<RequestAuth, String> {
+    match auth {
+        RequestAuth::None => Ok(RequestAuth::None),
+        RequestAuth::Bearer { token } => Ok(RequestAuth::Bearer {
+            token: resolve_template(token, environment).map_err(|e| e.to_string())?,
+        }),
+        RequestAuth::Basic { username, password } => Ok(RequestAuth::Basic {
+            username: resolve_template(username, environment).map_err(|e| e.to_string())?,
+            password: resolve_template(password, environment).map_err(|e| e.to_string())?,
+        }),
+        RequestAuth::ApiKey {
+            key,
+            value,
+            location,
+        } => Ok(RequestAuth::ApiKey {
+            key: resolve_template(key, environment).map_err(|e| e.to_string())?,
+            value: resolve_template(value, environment).map_err(|e| e.to_string())?,
+            location: *location,
+        }),
+    }
+}
+
 /// Applies simple single-line text editing keys to `input`.
 fn handle_single_line_text_input(input: &mut TextInput, key: KeyEvent) {
     match key.code {
@@ -1737,6 +1881,7 @@ fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
     contains_case_insensitive(entry.method.as_str(), query)
         || contains_case_insensitive(&entry.url, query)
         || check_query_params(&entry.query_params, query)
+        || check_auth(&entry.auth, query)
         || check_headers(&entry.headers, query)
         || entry
             .body
@@ -1750,6 +1895,35 @@ fn check_query_params(params: &[QueryParam], query: &str) -> bool {
         contains_case_insensitive(&param.key, query)
             || contains_case_insensitive(&param.value, query)
     })
+}
+
+/// Checks auth helper fields for a case-insensitive search match.
+fn check_auth(auth: &RequestAuth, query: &str) -> bool {
+    match auth {
+        RequestAuth::None => false,
+        RequestAuth::Bearer { token } => {
+            contains_case_insensitive("bearer", query) || contains_case_insensitive(token, query)
+        }
+        RequestAuth::Basic { username, password } => {
+            contains_case_insensitive("basic", query)
+                || contains_case_insensitive(username, query)
+                || contains_case_insensitive(password, query)
+        }
+        RequestAuth::ApiKey {
+            key,
+            value,
+            location,
+        } => {
+            let location = match location {
+                ApiKeyLocation::Header => "header",
+                ApiKeyLocation::Query => "query",
+            };
+            contains_case_insensitive("api key", query)
+                || contains_case_insensitive(location, query)
+                || contains_case_insensitive(key, query)
+                || contains_case_insensitive(value, query)
+        }
+    }
 }
 
 /// Checks entry or request headers.
@@ -1775,6 +1949,7 @@ fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
         || contains_case_insensitive(request.method.as_str(), query)
         || contains_case_insensitive(&request.url, query)
         || check_query_params(&request.query_params, query)
+        || check_auth(&request.auth, query)
         || check_headers(&request.headers, query)
         || request
             .body
@@ -1869,6 +2044,7 @@ mod tests {
             method,
             url: url.to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers,
             body: body.map(ToString::to_string),
         })
@@ -1885,6 +2061,7 @@ mod tests {
             method,
             url: url.to_string(),
             query_params: Vec::new(),
+            auth: RequestAuth::None,
             headers: Vec::new(),
             body: body.map(ToString::to_string),
         };
@@ -1975,6 +2152,45 @@ mod tests {
         ];
 
         assert_eq!(format_query_params(&params), "search=ada\n# archived=true");
+    }
+
+    /// Auth helper text parses common auth modes.
+    #[test]
+    fn auth_text_parses_supported_modes() {
+        assert_eq!(
+            parse_auth("bearer token={{token}}"),
+            RequestAuth::Bearer {
+                token: "{{token}}".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_auth("basic username=ada password=secret"),
+            RequestAuth::Basic {
+                username: "ada".to_string(),
+                password: "secret".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_auth("api-key-query key=api_key value=abc123"),
+            RequestAuth::ApiKey {
+                key: "api_key".to_string(),
+                value: "abc123".to_string(),
+                location: ApiKeyLocation::Query,
+            }
+        );
+    }
+
+    /// Auth helpers round-trip through the editor format.
+    #[test]
+    fn auth_formats_for_editor() {
+        assert_eq!(
+            format_auth(&RequestAuth::ApiKey {
+                key: "X-API-Key".to_string(),
+                value: "{{api_key}}".to_string(),
+                location: ApiKeyLocation::Header,
+            }),
+            "api-key-header key=X-API-Key value={{api_key}}"
+        );
     }
 
     /// Empty search returns every history entry.
@@ -2540,6 +2756,9 @@ mod tests {
         app.active_tab_mut()
             .params
             .set_content("search=ada\n# archived=true");
+        app.active_tab_mut()
+            .auth
+            .set_content("bearer token={{token}}");
 
         app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
 
@@ -2556,6 +2775,12 @@ mod tests {
                     value: "true".to_string(),
                 },
             ]
+        );
+        assert_eq!(
+            app.saved_requests[0].auth,
+            RequestAuth::Bearer {
+                token: "{{token}}".to_string(),
+            }
         );
         let _ = std::fs::remove_file(&app.config.saved_requests_file);
     }
@@ -2658,6 +2883,9 @@ mod tests {
             "status".to_string(),
             "pending".to_string(),
         )];
+        saved.auth = RequestAuth::Bearer {
+            token: "{{token}}".to_string(),
+        };
         let mut app = app_with_saved_requests(vec![saved]);
 
         app.load_from_saved_request();
@@ -2665,6 +2893,7 @@ mod tests {
         assert_eq!(app.current_method(), &HttpMethod::Post);
         assert_eq!(app.active_tab().url.content(), "https://example.com/orders");
         assert_eq!(app.active_tab().params.content(), "status=pending");
+        assert_eq!(app.active_tab().auth.content(), "bearer token={{token}}");
         assert_eq!(app.active_tab().body.content(), "{\"status\":\"pending\"}");
     }
 
@@ -2687,9 +2916,9 @@ mod tests {
         assert_eq!(app.status_message, "Environment: Prod");
     }
 
-    /// Enter in the URL field queues a request with headers and query params.
+    /// Enter in the URL field queues a request with headers, query params, and auth.
     #[test]
-    fn enter_in_url_queues_request_with_headers_and_query_params() {
+    fn enter_in_url_queues_request_with_headers_query_params_and_auth() {
         let mut app = app_with_history(Vec::new());
         app.focus = Focus::Url;
         app.active_tab_mut()
@@ -2698,6 +2927,9 @@ mod tests {
         app.active_tab_mut()
             .params
             .set_content("q=ada lovelace\n# archived=true");
+        app.active_tab_mut()
+            .auth
+            .set_content("api-key-query key=api_key value=abc123");
         app.active_tab_mut()
             .headers
             .set_content("Authorization: Bearer token");
@@ -2725,8 +2957,16 @@ mod tests {
             vec![("Authorization".to_string(), "Bearer token".to_string())]
         );
         assert_eq!(
+            request.request.auth,
+            RequestAuth::ApiKey {
+                key: "api_key".to_string(),
+                value: "abc123".to_string(),
+                location: ApiKeyLocation::Query,
+            }
+        );
+        assert_eq!(
             request.request.url_with_query_params(),
-            "https://example.com/search?q=ada%20lovelace"
+            "https://example.com/search?q=ada%20lovelace&api_key=abc123"
         );
     }
 
@@ -2737,6 +2977,9 @@ mod tests {
         app.environments = vec![environment("Local", "http://localhost:8080")];
         app.environment_index = Some(0);
         app.active_tab_mut().url.set_content("{{base_url}}/users");
+        app.active_tab_mut()
+            .auth
+            .set_content("bearer token={{token}}");
         app.active_tab_mut()
             .headers
             .set_content("Authorization: Bearer {{token}}");
@@ -2753,6 +2996,10 @@ mod tests {
         assert_eq!(request.request.url, "http://localhost:8080/users");
         assert_eq!(
             request.request.headers,
+            vec![("Authorization".to_string(), "Bearer abc123".to_string())]
+        );
+        assert_eq!(
+            request.request.headers_with_auth(),
             vec![("Authorization".to_string(), "Bearer abc123".to_string())]
         );
         assert_eq!(

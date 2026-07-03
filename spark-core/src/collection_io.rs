@@ -1,7 +1,7 @@
 //! Import and export for saved request collections.
 
 use crate::{
-    http::{ApiKeyLocation, HttpMethod, QueryParam, RequestAuth},
+    http::{ApiKeyLocation, HttpMethod, QueryParam, RequestAuth, RequestScripts},
     saved::{DEFAULT_COLLECTION, SavedRequest, write_saved_requests},
 };
 use anyhow::{Context, anyhow};
@@ -189,6 +189,7 @@ fn collect_postman_items(
             });
         let query_params = postman_query_params(request_value.get("url"));
         let auth = postman_auth(request_value.get("auth"));
+        let scripts = postman_scripts(item.get("event"));
         let body = request_value
             .pointer("/body/raw")
             .and_then(Value::as_str)
@@ -205,8 +206,48 @@ fn collect_postman_items(
             auth,
             headers,
             body,
+            scripts,
             updated_at: Utc::now(),
         });
+    }
+}
+
+/// Extracts pre-request and test scripts from Postman item events.
+fn postman_scripts(value: Option<&Value>) -> RequestScripts {
+    let mut scripts = RequestScripts::default();
+    let Some(events) = value.and_then(Value::as_array) else {
+        return scripts;
+    };
+
+    for event in events {
+        let Some(listen) = event.get("listen").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(script) = postman_event_script(event) else {
+            continue;
+        };
+        match listen {
+            "prerequest" => scripts.pre_request = script,
+            "test" => scripts.tests = script,
+            _ => {}
+        }
+    }
+    scripts
+}
+
+/// Extracts a Postman event script body.
+fn postman_event_script(event: &Value) -> Option<String> {
+    let exec = event.pointer("/script/exec")?;
+    match exec {
+        Value::String(script) => Some(script.clone()),
+        Value::Array(lines) => Some(
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
     }
 }
 
@@ -366,6 +407,7 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
                 auth: RequestAuth::None,
                 headers,
                 body,
+                scripts: RequestScripts::default(),
                 updated_at: Utc::now(),
             });
         }
@@ -512,9 +554,37 @@ fn postman_request_item(request: &SavedRequest) -> Value {
         request_value["auth"] = auth;
     }
 
-    json!({
+    let mut item = json!({
         "name": request.name,
         "request": request_value,
+    });
+    let events = postman_event_values(&request.scripts);
+    if !events.is_empty() {
+        item["event"] = Value::Array(events);
+    }
+    item
+}
+
+/// Converts Spark scripts into Postman event values.
+fn postman_event_values(scripts: &RequestScripts) -> Vec<Value> {
+    let mut events = Vec::new();
+    if !scripts.pre_request.trim().is_empty() {
+        events.push(postman_event_value("prerequest", &scripts.pre_request));
+    }
+    if !scripts.tests.trim().is_empty() {
+        events.push(postman_event_value("test", &scripts.tests));
+    }
+    events
+}
+
+/// Builds one Postman event value.
+fn postman_event_value(listen: &str, script: &str) -> Value {
+    json!({
+        "listen": listen,
+        "script": {
+            "type": "text/javascript",
+            "exec": script.lines().collect::<Vec<_>>(),
+        }
     })
 }
 
@@ -693,6 +763,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
             body: Some("{\"name\":\"Ada\"}".to_string()),
+            scripts: RequestScripts::default(),
             updated_at: Utc::now(),
         }
     }
@@ -706,6 +777,16 @@ mod tests {
             "name": "Users",
             "item": [{
               "name": "Create user",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {"exec": ["set trace={{trace_id}}", "header X-Trace: {{trace}}"]}
+                },
+                {
+                  "listen": "test",
+                  "script": {"exec": ["status 201", "body contains Ada"]}
+                }
+              ],
               "request": {
                 "method": "POST",
                 "header": [{"key":"Content-Type","value":"application/json"}],
@@ -750,6 +831,11 @@ mod tests {
                 token: "{{token}}".to_string(),
             }
         );
+        assert_eq!(
+            imported[0].scripts.pre_request,
+            "set trace={{trace_id}}\nheader X-Trace: {{trace}}"
+        );
+        assert_eq!(imported[0].scripts.tests, "status 201\nbody contains Ada");
     }
 
     /// Imports an `OpenAPI` operation with a server URL and tag.
@@ -806,6 +892,10 @@ mod tests {
             username: "ada".to_string(),
             password: "secret".to_string(),
         };
+        request.scripts = RequestScripts {
+            pre_request: "set trace=abc123".to_string(),
+            tests: "status 2xx".to_string(),
+        };
         let exported = export_postman(&[request]);
 
         assert_eq!(
@@ -829,6 +919,18 @@ mod tests {
                 .pointer("/item/0/item/0/item/0/request/auth/type")
                 .and_then(Value::as_str),
             Some("basic")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/event/0/listen")
+                .and_then(Value::as_str),
+            Some("prerequest")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/event/1/script/exec/0")
+                .and_then(Value::as_str),
+            Some("status 2xx")
         );
     }
 

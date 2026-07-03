@@ -1,7 +1,7 @@
 //! HTTP method/request/response types and curl-based request execution.
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// CRLF blank-line separator between HTTP headers and body.
 const CRLF_SEP: &str = "\r\n\r\n";
@@ -63,6 +63,35 @@ impl fmt::Display for HttpMethod {
     }
 }
 
+/// One query string parameter attached to an outgoing request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryParam {
+    /// Whether this parameter should be included in the outgoing URL.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Parameter name.
+    pub key: String,
+    /// Parameter value.
+    pub value: String,
+}
+
+impl QueryParam {
+    /// Creates an enabled query parameter.
+    #[must_use]
+    pub fn enabled(key: String, value: String) -> Self {
+        Self {
+            enabled: true,
+            key,
+            value,
+        }
+    }
+}
+
+/// Returns the default enabled state for query params.
+const fn default_enabled() -> bool {
+    true
+}
+
 /// An outgoing HTTP request.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -70,6 +99,8 @@ pub struct HttpRequest {
     pub method: HttpMethod,
     /// Target URL.
     pub url: String,
+    /// Query string parameters appended to the target URL when enabled.
+    pub query_params: Vec<QueryParam>,
     /// Request headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
     /// Optional request body.
@@ -105,7 +136,7 @@ impl HttpRequest {
             .arg("-i")
             .arg("-X")
             .arg(self.method.as_str())
-            .arg(&self.url);
+            .arg(self.url_with_query_params());
 
         for (key, value) in &self.headers {
             cmd.arg("-H").arg(format!("{key}: {value}"));
@@ -130,6 +161,52 @@ impl HttpRequest {
 
         parse_response(&stdout, duration_ms)
     }
+
+    /// Returns the target URL with enabled query params appended.
+    #[must_use]
+    pub fn url_with_query_params(&self) -> String {
+        append_query_params(&self.url, &self.query_params)
+    }
+}
+
+/// Appends enabled query params to `url`, preserving existing query strings.
+fn append_query_params(url: &str, params: &[QueryParam]) -> String {
+    let mut pairs = params
+        .iter()
+        .filter(|param| param.enabled && !param.key.trim().is_empty())
+        .peekable();
+
+    if pairs.peek().is_none() {
+        return url.to_string();
+    }
+
+    let mut output = url.to_string();
+    let mut first = !url.contains('?');
+    for param in pairs {
+        output.push(if first { '?' } else { '&' });
+        first = false;
+        output.push_str(&percent_encode_component(param.key.trim()));
+        output.push('=');
+        output.push_str(&percent_encode_component(param.value.trim()));
+    }
+    output
+}
+
+/// Percent-encodes one query component.
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                encoded.push('%');
+                let _ = write!(encoded, "{byte:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 /// Parses the raw output of `curl -i` into an [`HttpResponse`].
@@ -185,4 +262,36 @@ fn parse_status_line(line: &str) -> Result<(u16, String), Box<dyn std::error::Er
         .parse::<u16>()
         .map_err(|_| format!("invalid status code: {code_str}"))?;
     Ok((code, text))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for HTTP request helpers.
+
+    use super::*;
+
+    /// Request URLs include enabled query parameters with encoding.
+    #[test]
+    fn url_with_query_params_appends_enabled_params() {
+        let request = HttpRequest {
+            method: HttpMethod::Get,
+            url: "https://example.com/search?existing=true".to_string(),
+            query_params: vec![
+                QueryParam::enabled("q".to_string(), "ada lovelace".to_string()),
+                QueryParam {
+                    enabled: false,
+                    key: "archived".to_string(),
+                    value: "true".to_string(),
+                },
+                QueryParam::enabled(String::new(), "skipped".to_string()),
+            ],
+            headers: Vec::new(),
+            body: None,
+        };
+
+        assert_eq!(
+            request.url_with_query_params(),
+            "https://example.com/search?existing=true&q=ada%20lovelace"
+        );
+    }
 }

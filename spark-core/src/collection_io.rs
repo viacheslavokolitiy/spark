@@ -1,7 +1,7 @@
 //! Import and export for saved request collections.
 
 use crate::{
-    http::HttpMethod,
+    http::{HttpMethod, QueryParam},
     saved::{DEFAULT_COLLECTION, SavedRequest, write_saved_requests},
 };
 use anyhow::{Context, anyhow};
@@ -187,6 +187,7 @@ fn collect_postman_items(
                     .filter_map(postman_header)
                     .collect::<Vec<_>>()
             });
+        let query_params = postman_query_params(request_value.get("url"));
         let body = request_value
             .pointer("/body/raw")
             .and_then(Value::as_str)
@@ -199,6 +200,7 @@ fn collect_postman_items(
             folder: folder.map(ToString::to_string),
             method,
             url,
+            query_params,
             headers,
             body,
             updated_at: Utc::now(),
@@ -214,6 +216,37 @@ fn postman_header(value: &Value) -> Option<(String, String)> {
         return None;
     }
     Some((key.to_string(), header_value.to_string()))
+}
+
+/// Extracts query parameters from a Postman request URL value.
+fn postman_query_params(value: Option<&Value>) -> Vec<QueryParam> {
+    let Some(query) = value
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("query"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    query.iter().filter_map(postman_query_param).collect()
+}
+
+/// Parses a Postman query parameter entry.
+fn postman_query_param(value: &Value) -> Option<QueryParam> {
+    let key = value.get("key")?.as_str()?.trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    let query_value = value.get("value").and_then(Value::as_str).unwrap_or("");
+    Some(QueryParam {
+        enabled: !value
+            .get("disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        key: key.to_string(),
+        value: query_value.to_string(),
+    })
 }
 
 /// Extracts a URL from a Postman request URL value.
@@ -269,6 +302,7 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
                 .filter(|tag| !tag.trim().is_empty())
                 .map(ToString::to_string);
             let headers = openapi_header_parameters(operation);
+            let query_params = openapi_query_parameters(operation);
             let body = openapi_request_body(operation);
 
             requests.push(SavedRequest {
@@ -277,6 +311,7 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
                 folder,
                 method,
                 url: format!("{base_url}{path}"),
+                query_params,
                 headers,
                 body,
                 updated_at: Utc::now(),
@@ -285,6 +320,21 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
     }
 
     Ok(requests)
+}
+
+/// Extracts query parameters from an `OpenAPI` operation.
+fn openapi_query_parameters(operation: &Value) -> Vec<QueryParam> {
+    operation
+        .get("parameters")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|parameter| parameter.get("in").and_then(Value::as_str) == Some("query"))
+        .filter_map(|parameter| {
+            let name = parameter.get("name")?.as_str()?;
+            Some(QueryParam::enabled(name.to_string(), String::new()))
+        })
+        .collect()
 }
 
 /// Extracts header parameters from an `OpenAPI` operation.
@@ -391,6 +441,21 @@ fn postman_request_item(request: &SavedRequest) -> Value {
             "raw": body,
         });
     }
+    if !request.query_params.is_empty() {
+        request_value["url"]["query"] = json!(
+            request
+                .query_params
+                .iter()
+                .map(|param| {
+                    json!({
+                        "key": param.key,
+                        "value": param.value,
+                        "disabled": !param.enabled,
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 
     json!({
         "name": request.name,
@@ -454,6 +519,23 @@ fn openapi_operation(request: &SavedRequest) -> Value {
                 .collect::<Vec<_>>()
         );
     }
+    if !request.query_params.is_empty() {
+        if operation.get("parameters").is_none() {
+            operation["parameters"] = json!([]);
+        }
+        let parameters = operation
+            .get_mut("parameters")
+            .and_then(Value::as_array_mut)
+            .expect("parameters should be an array after initialization");
+        parameters.extend(request.query_params.iter().map(|param| {
+            json!({
+                "name": param.key,
+                "in": "query",
+                "required": false,
+                "schema": { "type": "string" }
+            })
+        }));
+    }
     if let Some(body) = &request.body
         && !body.trim().is_empty()
     {
@@ -515,6 +597,7 @@ mod tests {
             folder: Some("Users".to_string()),
             method,
             url: url.to_string(),
+            query_params: Vec::new(),
             headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
             body: Some("{\"name\":\"Ada\"}".to_string()),
             updated_at: Utc::now(),
@@ -533,7 +616,13 @@ mod tests {
               "request": {
                 "method": "POST",
                 "header": [{"key":"Content-Type","value":"application/json"}],
-                "url": {"raw":"https://api.example.com/users"},
+                "url": {
+                  "raw":"https://api.example.com/users",
+                  "query": [
+                    {"key":"active","value":"true"},
+                    {"key":"archived","value":"false","disabled":true}
+                  ]
+                },
                 "body": {"mode":"raw","raw":"{\"name\":\"Ada\"}"}
               }
             }]
@@ -547,6 +636,17 @@ mod tests {
         assert_eq!(imported[0].folder.as_deref(), Some("Users"));
         assert_eq!(imported[0].method, HttpMethod::Post);
         assert_eq!(imported[0].headers[0].0, "Content-Type");
+        assert_eq!(
+            imported[0].query_params,
+            vec![
+                QueryParam::enabled("active".to_string(), "true".to_string()),
+                QueryParam {
+                    enabled: false,
+                    key: "archived".to_string(),
+                    value: "false".to_string(),
+                },
+            ]
+        );
     }
 
     /// Imports an `OpenAPI` operation with a server URL and tag.
@@ -590,11 +690,16 @@ mod tests {
     /// Exports requests as Postman collection items.
     #[test]
     fn exports_postman_collection() {
-        let exported = export_postman(&[saved_request(
+        let mut request = saved_request(
             "Create user",
             HttpMethod::Post,
             "https://api.example.com/users",
-        )]);
+        );
+        request.query_params = vec![QueryParam::enabled(
+            "active".to_string(),
+            "true".to_string(),
+        )];
+        let exported = export_postman(&[request]);
 
         assert_eq!(
             exported.pointer("/item/0/name").and_then(Value::as_str),
@@ -605,6 +710,12 @@ mod tests {
                 .pointer("/item/0/item/0/item/0/request/method")
                 .and_then(Value::as_str),
             Some("POST")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/request/url/query/0/key")
+                .and_then(Value::as_str),
+            Some("active")
         );
     }
 

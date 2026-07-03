@@ -8,7 +8,7 @@ use spark_core::{
     config::Config,
     environment::{Environment, load_environments, resolve_template},
     history::{HistoryEntry, append_history, load_history},
-    http::{HttpMethod, HttpRequest, HttpResponse},
+    http::{HttpMethod, HttpRequest, HttpResponse, QueryParam},
     saved::{
         DEFAULT_COLLECTION, SavedRequest, load_saved_requests, remove_saved_request,
         upsert_saved_request,
@@ -28,6 +28,8 @@ pub enum Focus {
     Method,
     /// URL input field.
     Url,
+    /// Query parameter editor.
+    Params,
     /// Headers text area.
     Headers,
     /// Body text area.
@@ -347,6 +349,8 @@ impl RenameTabDialog {
 /// Which text area a generic key handler should target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextAreaTarget {
+    /// Query params editor.
+    Params,
     /// Headers editor.
     Headers,
     /// Body editor.
@@ -362,6 +366,8 @@ pub struct RequestTab {
     pub method_index: usize,
     /// URL input for this tab.
     pub url: TextInput,
+    /// Query parameter editor for this tab.
+    pub params: TextInput,
     /// Header editor for this tab.
     pub headers: TextInput,
     /// Body editor for this tab.
@@ -383,6 +389,7 @@ impl RequestTab {
             custom_title: None,
             method_index: 0,
             url: TextInput::single_line(),
+            params: TextInput::multi_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
             response: None,
@@ -613,6 +620,7 @@ impl App {
             Focus::Search => self.handle_search_key(key),
             Focus::Method => self.handle_method_key(key),
             Focus::Url => self.handle_url_key(key),
+            Focus::Params => self.handle_text_area_key(key, TextAreaTarget::Params),
             Focus::Headers => self.handle_text_area_key(key, TextAreaTarget::Headers),
             Focus::Body => self.handle_text_area_key(key, TextAreaTarget::Body),
             Focus::Response => self.handle_response_key(key),
@@ -674,7 +682,7 @@ impl App {
     fn focus_accepts_text(&self) -> bool {
         matches!(
             self.focus,
-            Focus::Search | Focus::Url | Focus::Headers | Focus::Body
+            Focus::Search | Focus::Url | Focus::Params | Focus::Headers | Focus::Body
         )
     }
 
@@ -761,7 +769,8 @@ impl App {
             Focus::History => Focus::Search,
             Focus::Search => Focus::Method,
             Focus::Method => Focus::Url,
-            Focus::Url => Focus::Headers,
+            Focus::Url => Focus::Params,
+            Focus::Params => Focus::Headers,
             Focus::Headers => Focus::Body,
             Focus::Body => Focus::Response,
             Focus::Response => Focus::History,
@@ -776,7 +785,8 @@ impl App {
             Focus::Search => Focus::History,
             Focus::Method => Focus::Search,
             Focus::Url => Focus::Method,
-            Focus::Headers => Focus::Url,
+            Focus::Params => Focus::Url,
+            Focus::Headers => Focus::Params,
             Focus::Body => Focus::Headers,
             Focus::Response => Focus::Body,
         };
@@ -908,6 +918,7 @@ impl App {
         }
 
         let area = match target {
+            TextAreaTarget::Params => &mut self.active_tab_mut().params,
             TextAreaTarget::Headers => &mut self.active_tab_mut().headers,
             TextAreaTarget::Body => &mut self.active_tab_mut().body,
         };
@@ -1099,6 +1110,7 @@ impl App {
 
         let method = entry.method;
         let url = entry.url.clone();
+        let params_text = format_query_params(&entry.query_params);
         let headers_text = format_headers(&entry.headers);
         let body_text = entry.body.clone().unwrap_or_default();
 
@@ -1107,6 +1119,7 @@ impl App {
         }
 
         self.active_tab_mut().url.set_content(&url);
+        self.active_tab_mut().params.set_content(&params_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
 
@@ -1133,6 +1146,7 @@ impl App {
         let method = request.method;
         let url = request.url.clone();
         let name = request.name.clone();
+        let params_text = format_query_params(&request.query_params);
         let headers_text = format_headers(&request.headers);
         let body_text = request.body.clone().unwrap_or_default();
 
@@ -1141,6 +1155,7 @@ impl App {
         }
 
         self.active_tab_mut().url.set_content(&url);
+        self.active_tab_mut().params.set_content(&params_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
 
@@ -1401,6 +1416,8 @@ impl App {
         }
 
         let method = *self.current_method();
+        let params_text = tab.params.text();
+        let query_params = parse_query_params(params_text.as_ref());
         let headers_text = tab.headers.text();
         let headers = parse_headers(headers_text.as_ref());
         let body_text = tab.body.text();
@@ -1413,6 +1430,7 @@ impl App {
         Some(HttpRequest {
             method,
             url: url.to_string(),
+            query_params,
             headers,
             body,
         })
@@ -1434,6 +1452,20 @@ impl App {
     fn resolve_request_template(&self, request: &HttpRequest) -> Result<HttpRequest, String> {
         let environment = self.active_environment();
         let url = resolve_template(&request.url, environment).map_err(|e| e.to_string())?;
+        let query_params = request
+            .query_params
+            .iter()
+            .map(|param| {
+                let key = resolve_template(&param.key, environment).map_err(|e| e.to_string())?;
+                let value =
+                    resolve_template(&param.value, environment).map_err(|e| e.to_string())?;
+                Ok(QueryParam {
+                    enabled: param.enabled,
+                    key,
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let headers = request
             .headers
             .iter()
@@ -1452,6 +1484,7 @@ impl App {
         Ok(HttpRequest {
             method: request.method,
             url,
+            query_params,
             headers,
             body,
         })
@@ -1633,6 +1666,54 @@ fn format_headers(headers: &[(String, String)]) -> String {
     text
 }
 
+/// Parses raw query param text into enabled/disabled key-value pairs.
+fn parse_query_params(text: &str) -> Vec<QueryParam> {
+    text.lines().filter_map(parse_query_param_line).collect()
+}
+
+/// Parses one query param editor line.
+fn parse_query_param_line(line: &str) -> Option<QueryParam> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (enabled, content) = if let Some(disabled) = trimmed.strip_prefix('#') {
+        (false, disabled.trim())
+    } else {
+        (true, trimmed)
+    };
+    if content.is_empty() {
+        return None;
+    }
+
+    let (key, value) = content
+        .split_once('=')
+        .map_or((content, ""), |(key, value)| (key, value));
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    Some(QueryParam {
+        enabled,
+        key: key.to_string(),
+        value: value.trim().to_string(),
+    })
+}
+
+/// Formats query params for the params editor.
+fn format_query_params(params: &[QueryParam]) -> String {
+    params
+        .iter()
+        .map(|param| {
+            let prefix = if param.enabled { "" } else { "# " };
+            format!("{prefix}{}={}", param.key, param.value)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Applies simple single-line text editing keys to `input`.
 fn handle_single_line_text_input(input: &mut TextInput, key: KeyEvent) {
     match key.code {
@@ -1655,11 +1736,20 @@ fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
 
     contains_case_insensitive(entry.method.as_str(), query)
         || contains_case_insensitive(&entry.url, query)
+        || check_query_params(&entry.query_params, query)
         || check_headers(&entry.headers, query)
         || entry
             .body
             .as_deref()
             .is_some_and(|body| contains_case_insensitive(body, query))
+}
+
+/// Checks query parameters for a case-insensitive search match.
+fn check_query_params(params: &[QueryParam], query: &str) -> bool {
+    params.iter().any(|param| {
+        contains_case_insensitive(&param.key, query)
+            || contains_case_insensitive(&param.value, query)
+    })
 }
 
 /// Checks entry or request headers.
@@ -1684,6 +1774,7 @@ fn saved_request_matches(request: &SavedRequest, query: &str) -> bool {
         || contains_case_insensitive(&request.name, query)
         || contains_case_insensitive(request.method.as_str(), query)
         || contains_case_insensitive(&request.url, query)
+        || check_query_params(&request.query_params, query)
         || check_headers(&request.headers, query)
         || request
             .body
@@ -1777,6 +1868,7 @@ mod tests {
         HistoryEntry::from_request(&HttpRequest {
             method,
             url: url.to_string(),
+            query_params: Vec::new(),
             headers,
             body: body.map(ToString::to_string),
         })
@@ -1792,6 +1884,7 @@ mod tests {
         let request = HttpRequest {
             method,
             url: url.to_string(),
+            query_params: Vec::new(),
             headers: Vec::new(),
             body: body.map(ToString::to_string),
         };
@@ -1842,6 +1935,48 @@ mod tests {
         }
     }
 
+    /// Query param text parses enabled and disabled rows.
+    #[test]
+    fn query_param_text_parses_enabled_and_disabled_rows() {
+        let params = parse_query_params("search=ada\n# archived=true\nempty=\n=skipped");
+
+        assert_eq!(
+            params,
+            vec![
+                QueryParam {
+                    enabled: true,
+                    key: "search".to_string(),
+                    value: "ada".to_string(),
+                },
+                QueryParam {
+                    enabled: false,
+                    key: "archived".to_string(),
+                    value: "true".to_string(),
+                },
+                QueryParam {
+                    enabled: true,
+                    key: "empty".to_string(),
+                    value: String::new(),
+                },
+            ]
+        );
+    }
+
+    /// Query params round-trip through the editor format.
+    #[test]
+    fn query_params_format_for_editor() {
+        let params = vec![
+            QueryParam::enabled("search".to_string(), "ada".to_string()),
+            QueryParam {
+                enabled: false,
+                key: "archived".to_string(),
+                value: "true".to_string(),
+            },
+        ];
+
+        assert_eq!(format_query_params(&params), "search=ada\n# archived=true");
+    }
+
     /// Empty search returns every history entry.
     #[test]
     fn empty_history_search_shows_all_requests() {
@@ -1885,16 +2020,21 @@ mod tests {
         assert_eq!(app.history_index, 1);
     }
 
-    /// Search matches method, URL, headers, and request body.
+    /// Search matches method, URL, query params, headers, and request body.
     #[test]
     fn history_search_matches_request_parts_case_insensitively() {
+        let mut matching = history_entry(
+            HttpMethod::Post,
+            "https://example.com/orders",
+            vec![("Authorization".to_string(), "Bearer token".to_string())],
+            Some("{\"status\":\"pending\"}"),
+        );
+        matching.query_params = vec![QueryParam::enabled(
+            "state".to_string(),
+            "pending-review".to_string(),
+        )];
         let mut app = app_with_history(vec![
-            history_entry(
-                HttpMethod::Post,
-                "https://example.com/orders",
-                vec![("Authorization".to_string(), "Bearer token".to_string())],
-                Some("{\"status\":\"pending\"}"),
-            ),
+            matching,
             history_entry(
                 HttpMethod::Get,
                 "https://example.com/users",
@@ -1913,6 +2053,9 @@ mod tests {
         assert_eq!(app.filtered_history_indices(), vec![0]);
 
         app.history_search.set_content("pending");
+        assert_eq!(app.filtered_history_indices(), vec![0]);
+
+        app.history_search.set_content("state");
         assert_eq!(app.filtered_history_indices(), vec![0]);
     }
 
@@ -2394,12 +2537,26 @@ mod tests {
         app.active_tab_mut()
             .url
             .set_content("https://example.com/users");
+        app.active_tab_mut()
+            .params
+            .set_content("search=ada\n# archived=true");
 
         app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
 
         assert_eq!(app.sidebar_mode, SidebarMode::Saved);
         assert_eq!(app.saved_requests.len(), 1);
         assert_eq!(app.saved_requests[0].name, "GET https://example.com/users");
+        assert_eq!(
+            app.saved_requests[0].query_params,
+            vec![
+                QueryParam::enabled("search".to_string(), "ada".to_string()),
+                QueryParam {
+                    enabled: false,
+                    key: "archived".to_string(),
+                    value: "true".to_string(),
+                },
+            ]
+        );
         let _ = std::fs::remove_file(&app.config.saved_requests_file);
     }
 
@@ -2491,17 +2648,23 @@ mod tests {
     /// Loading a saved request copies it into the request composer.
     #[test]
     fn load_saved_request_populates_composer() {
-        let mut app = app_with_saved_requests(vec![saved_request(
+        let mut saved = saved_request(
             "Create order",
             HttpMethod::Post,
             "https://example.com/orders",
             Some("{\"status\":\"pending\"}"),
-        )]);
+        );
+        saved.query_params = vec![QueryParam::enabled(
+            "status".to_string(),
+            "pending".to_string(),
+        )];
+        let mut app = app_with_saved_requests(vec![saved]);
 
         app.load_from_saved_request();
 
         assert_eq!(app.current_method(), &HttpMethod::Post);
         assert_eq!(app.active_tab().url.content(), "https://example.com/orders");
+        assert_eq!(app.active_tab().params.content(), "status=pending");
         assert_eq!(app.active_tab().body.content(), "{\"status\":\"pending\"}");
     }
 
@@ -2522,6 +2685,49 @@ mod tests {
             Some("Prod")
         );
         assert_eq!(app.status_message, "Environment: Prod");
+    }
+
+    /// Enter in the URL field queues a request with headers and query params.
+    #[test]
+    fn enter_in_url_queues_request_with_headers_and_query_params() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::Url;
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/search");
+        app.active_tab_mut()
+            .params
+            .set_content("q=ada lovelace\n# archived=true");
+        app.active_tab_mut()
+            .headers
+            .set_content("Authorization: Bearer token");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        let request = app
+            .pending_request
+            .as_ref()
+            .expect("request should be queued");
+        assert_eq!(request.request.url, "https://example.com/search");
+        assert_eq!(
+            request.request.query_params,
+            vec![
+                QueryParam::enabled("q".to_string(), "ada lovelace".to_string()),
+                QueryParam {
+                    enabled: false,
+                    key: "archived".to_string(),
+                    value: "true".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            request.request.headers,
+            vec![("Authorization".to_string(), "Bearer token".to_string())]
+        );
+        assert_eq!(
+            request.request.url_with_query_params(),
+            "https://example.com/search?q=ada%20lovelace"
+        );
     }
 
     /// Sending resolves variables without mutating the composer template.

@@ -6,7 +6,7 @@ use ratatui::{Terminal, backend::Backend};
 use spark_core::{
     collection_io::{CollectionFormat, export_collection, import_into_saved_requests},
     config::Config,
-    environment::{Environment, load_environments, resolve_template},
+    environment::{Environment, load_environments, resolve_template, write_environments},
     history::{HistoryEntry, append_history, load_history},
     http::{
         ApiKeyLocation, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth,
@@ -254,6 +254,97 @@ pub enum CollectionIoDialogField {
     Format,
     /// File path input.
     Path,
+}
+
+/// Field currently focused inside the environment manager dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvironmentDialogField {
+    /// Environment list.
+    List,
+    /// Environment name input.
+    Name,
+    /// Environment variable editor.
+    Variables,
+}
+
+/// Environment manager dialog state.
+#[derive(Debug)]
+pub struct EnvironmentDialog {
+    /// Selected environment index, if an existing environment is selected.
+    pub selected_index: Option<usize>,
+    /// Environment name input.
+    pub name: TextInput,
+    /// Variable editor input, one `key=value` pair per line.
+    pub variables: TextInput,
+    /// Field currently receiving input.
+    pub field: EnvironmentDialogField,
+}
+
+impl EnvironmentDialog {
+    /// Creates an environment manager dialog from the active environment.
+    fn new(environments: &[Environment], active_index: Option<usize>) -> Self {
+        let selected_index = active_index.filter(|idx| *idx < environments.len());
+        let mut dialog = Self {
+            selected_index,
+            name: TextInput::single_line(),
+            variables: TextInput::multi_line(),
+            field: EnvironmentDialogField::List,
+        };
+        dialog.load_selected(environments);
+        dialog
+    }
+
+    /// Loads the selected environment into editable fields.
+    fn load_selected(&mut self, environments: &[Environment]) {
+        if let Some(environment) = self.selected_index.and_then(|idx| environments.get(idx)) {
+            self.name.set_content(&environment.name);
+            self.variables
+                .set_content(&format_environment_variables(&environment.variables));
+        } else {
+            self.name.set_content("");
+            self.variables.set_content("");
+        }
+    }
+
+    /// Clears fields for a new environment draft.
+    fn new_draft(&mut self) {
+        self.selected_index = None;
+        self.name.set_content("");
+        self.variables.set_content("");
+        self.field = EnvironmentDialogField::Name;
+    }
+
+    /// Moves focus to the next dialog field.
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            EnvironmentDialogField::List => EnvironmentDialogField::Name,
+            EnvironmentDialogField::Name => EnvironmentDialogField::Variables,
+            EnvironmentDialogField::Variables => EnvironmentDialogField::List,
+        };
+    }
+
+    /// Moves focus to the previous dialog field.
+    fn previous_field(&mut self) {
+        self.field = match self.field {
+            EnvironmentDialogField::List => EnvironmentDialogField::Variables,
+            EnvironmentDialogField::Name => EnvironmentDialogField::List,
+            EnvironmentDialogField::Variables => EnvironmentDialogField::Name,
+        };
+    }
+
+    /// Builds an environment from the editor fields.
+    fn environment(&self) -> Option<Environment> {
+        let name_text = self.name.text();
+        let name = name_text.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let variables_text = self.variables.text();
+        Some(Environment {
+            name: name.to_string(),
+            variables: parse_environment_variables(variables_text.as_ref()),
+        })
+    }
 }
 
 /// Format selector state for collection import/export.
@@ -596,6 +687,8 @@ pub struct App {
     pub rename_tab_dialog: Option<RenameTabDialog>,
     /// Active collection import/export dialog.
     pub collection_io_dialog: Option<CollectionIoDialog>,
+    /// Active environment manager dialog.
+    pub environment_dialog: Option<EnvironmentDialog>,
     /// Active or most recent collection runner state.
     pub collection_run: Option<CollectionRun>,
     /// Request waiting for a painted "sending" frame before execution.
@@ -632,6 +725,7 @@ impl App {
             save_dialog: None,
             rename_tab_dialog: None,
             collection_io_dialog: None,
+            environment_dialog: None,
             collection_run: None,
             pending_request: None,
             should_quit: false,
@@ -670,6 +764,15 @@ impl App {
 
     /// Dispatches a key event to the appropriate handler.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.environment_dialog.is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                self.should_quit = true;
+                return;
+            }
+            self.handle_environment_dialog_key(key);
+            return;
+        }
+
         if self.collection_io_dialog.is_some() {
             if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 self.should_quit = true;
@@ -697,63 +800,8 @@ impl App {
             return;
         }
 
-        // Global shortcuts regardless of focus.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => {
-                    self.should_quit = true;
-                    return;
-                }
-                KeyCode::Char('s') => {
-                    self.send_request();
-                    return;
-                }
-                KeyCode::Char('p') => {
-                    self.open_save_dialog();
-                    return;
-                }
-                KeyCode::Char('l') => {
-                    self.open_collection_io_dialog(CollectionIoMode::Import);
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    self.open_collection_io_dialog(CollectionIoMode::Export);
-                    return;
-                }
-                KeyCode::Char('g') => {
-                    self.start_collection_run_from_selection();
-                    return;
-                }
-                KeyCode::Char('t') => {
-                    self.open_new_request_tab();
-                    return;
-                }
-                KeyCode::Char('w') => {
-                    self.close_active_request_tab();
-                    return;
-                }
-                KeyCode::Char('r') => {
-                    self.open_rename_tab_dialog();
-                    return;
-                }
-                KeyCode::Left => {
-                    self.select_previous_request_tab();
-                    return;
-                }
-                KeyCode::Right => {
-                    self.select_next_request_tab();
-                    return;
-                }
-                KeyCode::Char('o') => {
-                    self.toggle_sidebar_mode();
-                    return;
-                }
-                KeyCode::Char('e') => {
-                    self.select_next_environment();
-                    return;
-                }
-                _ => {}
-            }
+        if self.handle_control_shortcut(key) {
+            return;
         }
 
         if self.handle_vim_action_key(key) {
@@ -777,9 +825,34 @@ impl App {
         }
     }
 
+    /// Handles global control-modified shortcuts.
+    fn handle_control_shortcut(&mut self, key: KeyEvent) -> bool {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('c') => self.should_quit = true,
+            KeyCode::Char('s') => self.send_request(),
+            KeyCode::Char('p') => self.open_save_dialog(),
+            KeyCode::Char('l') => self.open_collection_io_dialog(CollectionIoMode::Import),
+            KeyCode::Char('x') => self.open_collection_io_dialog(CollectionIoMode::Export),
+            KeyCode::Char('g') => self.start_collection_run_from_selection(),
+            KeyCode::Char('t') => self.open_new_request_tab(),
+            KeyCode::Char('w') => self.close_active_request_tab(),
+            KeyCode::Char('r') => self.open_rename_tab_dialog(),
+            KeyCode::Left => self.select_previous_request_tab(),
+            KeyCode::Right => self.select_next_request_tab(),
+            KeyCode::Char('o') => self.toggle_sidebar_mode(),
+            KeyCode::Char('e') => self.select_next_environment(),
+            _ => return false,
+        }
+        true
+    }
+
     /// Handles vim-style command keys when focus is not inside an editor.
     fn handle_vim_action_key(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers != KeyModifiers::NONE || self.focus_accepts_text() {
+        if !vim_action_modifiers_are_allowed(key.modifiers) || self.focus_accepts_text() {
             return false;
         }
 
@@ -818,6 +891,10 @@ impl App {
             }
             KeyCode::Char('X') => {
                 self.open_collection_io_dialog(CollectionIoMode::Export);
+                true
+            }
+            KeyCode::Char('E') => {
+                self.open_environment_dialog();
                 true
             }
             KeyCode::Char('R') => {
@@ -1208,6 +1285,17 @@ impl App {
         self.status_message = format!("Renamed request tab to: {display_title}");
     }
 
+    /// Opens the environment manager dialog.
+    fn open_environment_dialog(&mut self) {
+        self.method_dropdown_open = false;
+        self.environment_dialog = Some(EnvironmentDialog::new(
+            &self.environments,
+            self.environment_index,
+        ));
+        self.status_message =
+            "Environment manager: n new, d delete, Ctrl+S save, Esc close.".to_string();
+    }
+
     /// Opens the collection import/export dialog.
     fn open_collection_io_dialog(&mut self, mode: CollectionIoMode) {
         self.method_dropdown_open = false;
@@ -1455,6 +1543,191 @@ impl App {
                 if let Some(dialog) = &mut self.rename_tab_dialog {
                     handle_single_line_text_input(&mut dialog.title, key);
                 }
+            }
+        }
+    }
+
+    /// Handles key input while the environment manager dialog is active.
+    fn handle_environment_dialog_key(&mut self, key: KeyEvent) {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.save_environment_dialog();
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.environment_dialog = None;
+                self.status_message = "Environment manager closed.".to_string();
+            }
+            KeyCode::Tab => {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    dialog.next_field();
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    dialog.previous_field();
+                }
+            }
+            KeyCode::Char('n')
+                if environment_dialog_accepts_command(self.environment_dialog.as_ref()) =>
+            {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    dialog.new_draft();
+                }
+                self.status_message = "New environment draft.".to_string();
+            }
+            KeyCode::Char('d')
+                if environment_dialog_accepts_command(self.environment_dialog.as_ref()) =>
+            {
+                self.delete_selected_environment();
+            }
+            _ => self.handle_environment_dialog_field_key(key),
+        }
+    }
+
+    /// Handles key input for the focused environment manager field.
+    fn handle_environment_dialog_field_key(&mut self, key: KeyEvent) {
+        let Some(field) = self.environment_dialog.as_ref().map(|dialog| dialog.field) else {
+            return;
+        };
+        match field {
+            EnvironmentDialogField::List => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.select_previous_environment_in_dialog(),
+                KeyCode::Down | KeyCode::Char('j') => self.select_next_environment_in_dialog(),
+                KeyCode::Enter => {
+                    self.environment_index = self
+                        .environment_dialog
+                        .as_ref()
+                        .and_then(|dialog| dialog.selected_index);
+                    if let Some(idx) = self.environment_index
+                        && let Some(environment) = self.environments.get(idx)
+                    {
+                        self.status_message = format!("Environment: {}", environment.name);
+                    }
+                }
+                _ => {}
+            },
+            EnvironmentDialogField::Name => {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    handle_single_line_text_input(&mut dialog.name, key);
+                }
+            }
+            EnvironmentDialogField::Variables => {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    match key.code {
+                        KeyCode::Enter => dialog.variables.insert_newline(),
+                        _ => handle_multi_line_text_input(&mut dialog.variables, key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Selects the previous environment in the manager dialog.
+    fn select_previous_environment_in_dialog(&mut self) {
+        let Some(dialog) = &mut self.environment_dialog else {
+            return;
+        };
+        if self.environments.is_empty() {
+            dialog.selected_index = None;
+            dialog.load_selected(&self.environments);
+            return;
+        }
+        let current = dialog.selected_index.unwrap_or(0);
+        dialog.selected_index = Some(current.saturating_sub(1));
+        dialog.load_selected(&self.environments);
+    }
+
+    /// Selects the next environment in the manager dialog.
+    fn select_next_environment_in_dialog(&mut self) {
+        let Some(dialog) = &mut self.environment_dialog else {
+            return;
+        };
+        if self.environments.is_empty() {
+            dialog.selected_index = None;
+            dialog.load_selected(&self.environments);
+            return;
+        }
+        let current = dialog.selected_index.unwrap_or(0);
+        dialog.selected_index = Some((current + 1).min(self.environments.len() - 1));
+        dialog.load_selected(&self.environments);
+    }
+
+    /// Saves the current environment manager fields to disk.
+    fn save_environment_dialog(&mut self) {
+        let Some(dialog) = &self.environment_dialog else {
+            return;
+        };
+        let Some(environment) = dialog.environment() else {
+            self.status_message = "Environment name is empty.".to_string();
+            return;
+        };
+
+        let index = if let Some(idx) = dialog
+            .selected_index
+            .filter(|idx| *idx < self.environments.len())
+        {
+            self.environments[idx] = environment;
+            idx
+        } else {
+            self.environments.push(environment);
+            self.environments.len() - 1
+        };
+
+        match write_environments(&self.config.environments_file, &self.environments) {
+            Ok(()) => {
+                self.environment_index = Some(index);
+                if let Some(dialog) = &mut self.environment_dialog {
+                    dialog.selected_index = Some(index);
+                    dialog.load_selected(&self.environments);
+                }
+                self.status_message =
+                    format!("Saved environment: {}", self.environments[index].name);
+            }
+            Err(e) => {
+                self.status_message = format!("Error saving environments: {e}");
+            }
+        }
+    }
+
+    /// Deletes the selected environment from the manager and disk.
+    fn delete_selected_environment(&mut self) {
+        let Some(dialog) = &self.environment_dialog else {
+            return;
+        };
+        let Some(idx) = dialog
+            .selected_index
+            .filter(|idx| *idx < self.environments.len())
+        else {
+            self.status_message = "No environment selected.".to_string();
+            return;
+        };
+        let removed = self.environments.remove(idx);
+        self.environment_index = self.environment_index.and_then(|active| {
+            if self.environments.is_empty() {
+                None
+            } else if active == idx {
+                Some(idx.min(self.environments.len() - 1))
+            } else if active > idx {
+                Some(active - 1)
+            } else {
+                Some(active)
+            }
+        });
+        match write_environments(&self.config.environments_file, &self.environments) {
+            Ok(()) => {
+                if let Some(dialog) = &mut self.environment_dialog {
+                    dialog.selected_index = self.environment_index;
+                    if dialog.selected_index.is_none() && !self.environments.is_empty() {
+                        dialog.selected_index = Some(0);
+                    }
+                    dialog.load_selected(&self.environments);
+                }
+                self.status_message = format!("Deleted environment: {}", removed.name);
+            }
+            Err(e) => {
+                self.status_message = format!("Error deleting environment: {e}");
             }
         }
     }
@@ -2496,6 +2769,55 @@ fn handle_single_line_text_input(input: &mut TextInput, key: KeyEvent) {
     }
 }
 
+/// Applies common multi-line text editing keys to `input`.
+fn handle_multi_line_text_input(input: &mut TextInput, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up => input.move_up(),
+        KeyCode::Down => input.move_down(),
+        _ => handle_single_line_text_input(input, key),
+    }
+}
+
+/// Returns whether the environment dialog should treat plain letters as commands.
+fn environment_dialog_accepts_command(dialog: Option<&EnvironmentDialog>) -> bool {
+    dialog.is_some_and(|dialog| dialog.field == EnvironmentDialogField::List)
+}
+
+/// Returns whether a key modifier set can trigger a vim-style action.
+fn vim_action_modifiers_are_allowed(modifiers: KeyModifiers) -> bool {
+    modifiers.is_empty() || modifiers == KeyModifiers::SHIFT
+}
+
+/// Parses environment variable editor text into key-value pairs.
+fn parse_environment_variables(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(parse_environment_variable_line)
+        .collect()
+}
+
+/// Parses one environment variable line.
+fn parse_environment_variable_line(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), value.trim().to_string()))
+}
+
+/// Formats environment variables for the editor.
+fn format_environment_variables(variables: &[(String, String)]) -> String {
+    variables
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Returns whether a history entry matches the search query.
 fn history_matches(entry: &HistoryEntry, query: &str) -> bool {
     let query = query.trim();
@@ -2764,6 +3086,11 @@ mod tests {
     /// Builds a control-modified key event for input handler tests.
     fn ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    /// Builds a shift-modified key event for input handler tests.
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
     }
 
     /// Types text through the app key handler.
@@ -3736,6 +4063,127 @@ mod tests {
             Some("Prod")
         );
         assert_eq!(app.status_message, "Environment: Prod");
+    }
+
+    /// Vim-style `E` opens the environment manager without changing active environment.
+    #[test]
+    fn vim_e_opens_environment_manager() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.focus = Focus::History;
+
+        app.handle_key(key(KeyCode::Char('E')));
+
+        let dialog = app
+            .environment_dialog
+            .as_ref()
+            .expect("environment dialog should open");
+        assert_eq!(dialog.selected_index, Some(0));
+        assert_eq!(dialog.name.content(), "Local");
+        assert_eq!(
+            dialog.variables.content(),
+            "base_url=http://localhost:8080\ntoken=abc123"
+        );
+    }
+
+    /// Shift-modified uppercase `E` opens the environment manager in real terminals.
+    #[test]
+    fn shifted_vim_e_opens_environment_manager() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::History;
+
+        app.handle_key(shift_key(KeyCode::Char('E')));
+
+        assert!(app.environment_dialog.is_some());
+    }
+
+    /// Environment manager can create and persist a new environment.
+    #[test]
+    fn environment_manager_saves_new_environment() {
+        let mut app = app_with_history(Vec::new());
+        app.focus = Focus::History;
+
+        app.handle_key(key(KeyCode::Char('E')));
+        app.handle_key(key(KeyCode::Char('n')));
+        type_text(&mut app, "Staging");
+        app.handle_key(key(KeyCode::Tab));
+        type_text(&mut app, "base_url=https://staging.example.com");
+        app.handle_key(key(KeyCode::Enter));
+        type_text(&mut app, "token=staging-token");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        assert_eq!(app.environments.len(), 1);
+        assert_eq!(app.environment_index, Some(0));
+        assert_eq!(app.environments[0].name, "Staging");
+        assert_eq!(
+            app.environments[0].variables,
+            vec![
+                (
+                    "base_url".to_string(),
+                    "https://staging.example.com".to_string()
+                ),
+                ("token".to_string(), "staging-token".to_string()),
+            ]
+        );
+        assert_eq!(
+            load_environments(&app.config.environments_file),
+            app.environments
+        );
+        assert_eq!(app.status_message, "Saved environment: Staging");
+        let _ = std::fs::remove_file(&app.config.environments_file);
+    }
+
+    /// Environment manager edits the selected environment in place.
+    #[test]
+    fn environment_manager_edits_selected_environment() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.focus = Focus::History;
+
+        app.handle_key(key(KeyCode::Char('E')));
+        app.handle_key(key(KeyCode::Tab));
+        app.environment_dialog
+            .as_mut()
+            .expect("environment dialog should open")
+            .name
+            .set_content("Dev");
+        app.handle_key(ctrl_key(KeyCode::Char('s')));
+
+        assert_eq!(app.environments.len(), 1);
+        assert_eq!(app.environments[0].name, "Dev");
+        assert_eq!(app.environment_index, Some(0));
+        assert_eq!(
+            load_environments(&app.config.environments_file),
+            app.environments
+        );
+        let _ = std::fs::remove_file(&app.config.environments_file);
+    }
+
+    /// Environment manager deletes the selected environment and clamps active selection.
+    #[test]
+    fn environment_manager_deletes_selected_environment() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![
+            environment("Local", "http://localhost:8080"),
+            environment("Prod", "https://api.example.com"),
+        ];
+        app.environment_index = Some(1);
+        app.focus = Focus::History;
+
+        app.handle_key(key(KeyCode::Char('E')));
+        app.handle_key(key(KeyCode::Char('d')));
+
+        assert_eq!(app.environments.len(), 1);
+        assert_eq!(app.environments[0].name, "Local");
+        assert_eq!(app.environment_index, Some(0));
+        assert_eq!(
+            load_environments(&app.config.environments_file),
+            app.environments
+        );
+        assert_eq!(app.status_message, "Deleted environment: Prod");
+        let _ = std::fs::remove_file(&app.config.environments_file);
     }
 
     /// Enter in the URL field queues a request with headers, query params, and auth.

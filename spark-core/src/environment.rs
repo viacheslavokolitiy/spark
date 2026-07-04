@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::Write;
 use std::path::Path;
 
 /// Opening marker for an environment variable reference.
@@ -74,6 +75,27 @@ pub fn load_environments(path: &Path) -> Vec<Environment> {
     };
 
     serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Rewrites the environment file with the provided environments.
+///
+/// If the file does not yet exist it is created along with any missing parent
+/// directories.
+///
+/// # Errors
+/// Returns an error if the file cannot be opened or written to.
+pub fn write_environments(path: &Path, environments: &[Environment]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(environments)?;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
 }
 
 /// Resolves `{{variable}}` references in `template` using `environment`.
@@ -195,6 +217,19 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "Local");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Environment files are rewritten in JSON format.
+    #[test]
+    fn write_environments_round_trips_json_array() {
+        let path =
+            std::env::temp_dir().join(format!("spark-env-write-test-{}.json", std::process::id()));
+
+        write_environments(&path, &[environment()]).expect("environment file writes");
+        let loaded = load_environments(&path);
+
+        assert_eq!(loaded, vec![environment()]);
         let _ = std::fs::remove_file(path);
     }
 }

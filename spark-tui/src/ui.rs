@@ -16,8 +16,8 @@ use tui_piechart::{
 };
 
 use crate::app::{
-    App, CollectionIoDialogField, CollectionIoMode, CollectionRun, CollectionRunResult, Focus,
-    ResponseTab, SaveDialogField, SidebarMode,
+    App, CollectionIoDialogField, CollectionIoMode, CollectionRun, CollectionRunResult,
+    EnvironmentDialogField, Focus, ResponseTab, SaveDialogField, SidebarMode,
 };
 
 /// Millisecond threshold at which durations switch to seconds.
@@ -32,7 +32,7 @@ const PRAGMA_HEADER: &str = "pragma";
 const VIM_NAV_KEY_HELP: &str = "j/k move  h/l switch  H/L tabs  Tab focus  Enter open/send  q quit";
 /// Always-visible footer action key help.
 const VIM_ACTION_KEY_HELP: &str =
-    "n new  x close  r rename  p save  I import  X export  R run  e env";
+    "n new  x close  r rename  p save  I import  X export  R run  e cycle  E envs";
 /// Always-visible legacy control shortcut help.
 const CONTROL_KEY_HELP: &str =
     "^S send ^P save ^L import ^X export ^G run ^T new ^W close ^R ren ^O side";
@@ -185,6 +185,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_save_dialog(frame, app, area);
     render_rename_tab_dialog(frame, app, area);
     render_collection_io_dialog(frame, app, area);
+    render_environment_dialog(frame, app, area);
 }
 
 /// Renders the open request tab selector.
@@ -1833,6 +1834,125 @@ fn render_collection_io_dialog(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::DarkGray)),
         rows[3],
     );
+}
+
+/// Renders the environment manager dialog when it is active.
+fn render_environment_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.environment_dialog else {
+        return;
+    };
+
+    let dialog_area = centered_rect(area, 78, 20);
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .title(" Environments ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
+        .split(rows[0]);
+    let editor_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(cols[1]);
+
+    render_environment_dialog_list(frame, app, cols[0]);
+    render_save_dialog_input(
+        frame,
+        " Name ",
+        dialog.name.text().as_ref(),
+        dialog.name.cursor_col,
+        dialog.field == EnvironmentDialogField::Name,
+        editor_rows[0],
+    );
+    render_environment_variables_input(frame, app, editor_rows[1]);
+    frame.render_widget(
+        Paragraph::new("Tab: switch | n: new | d: delete | Ctrl+S: save | Esc: close")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
+}
+
+/// Renders the environment manager list.
+fn render_environment_dialog_list(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app
+        .environment_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.field == EnvironmentDialogField::List);
+    let selected = app
+        .environment_dialog
+        .as_ref()
+        .and_then(|dialog| dialog.selected_index);
+
+    let items = if app.environments.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  No environments",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.environments
+            .iter()
+            .enumerate()
+            .map(|(idx, environment)| {
+                let marker = if app.environment_index == Some(idx) {
+                    "* "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(Color::Cyan)),
+                    Span::raw(environment.name.clone()),
+                ]))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let block = Block::default()
+        .title(" List ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+    let mut state = ListState::default();
+    state.select(selected.filter(|_| !app.environments.is_empty()));
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Renders the environment variable editor.
+fn render_environment_variables_input(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(dialog) = &app.environment_dialog else {
+        return;
+    };
+    let focused = dialog.field == EnvironmentDialogField::Variables;
+    let block = Block::default()
+        .title(" Variables  (key=value per line | # comments) ")
+        .borders(Borders::ALL)
+        .border_style(border_style(focused));
+    let text = dialog.variables.text();
+    let para = Paragraph::new(text.as_ref())
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+
+    if focused {
+        let cx = (area.x + 1 + cursor_offset(dialog.variables.cursor_col))
+            .min(area.x + area.width.saturating_sub(2));
+        let cy = (area.y + 1 + cursor_offset(dialog.variables.cursor_row))
+            .min(area.y + area.height.saturating_sub(2));
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
 /// Returns a centered rectangle with bounded dimensions.

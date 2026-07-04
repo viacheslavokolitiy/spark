@@ -1,6 +1,6 @@
 //! Request history persistence in JSONL (newline-delimited JSON) format.
 
-use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth, RequestScripts};
+use crate::http::{BodyMode, HttpMethod, HttpRequest, QueryParam, RequestAuth, RequestScripts};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -30,6 +30,9 @@ pub struct HistoryEntry {
     pub headers: Vec<(String, String)>,
     /// Request body, if any was sent.
     pub body: Option<String>,
+    /// Mode used to interpret the request body.
+    #[serde(default)]
+    pub body_mode: BodyMode,
     /// Pre-request and response test scripts.
     #[serde(default)]
     pub scripts: RequestScripts,
@@ -51,6 +54,7 @@ impl HistoryEntry {
             auth: req.auth.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
+            body_mode: req.body_mode,
             scripts: req.scripts.clone(),
             response_code: None,
             timestamp: Utc::now(),
@@ -183,6 +187,7 @@ mod tests {
         .expect("old history entry should deserialize");
 
         assert_eq!(entry.response_code, None);
+        assert_eq!(entry.body_mode, BodyMode::Raw);
     }
 
     /// Response codes are persisted when present.
@@ -195,6 +200,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
         let entry = HistoryEntry::from_response(&request, 201);

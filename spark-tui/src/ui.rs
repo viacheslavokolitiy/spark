@@ -35,7 +35,7 @@ const VIM_ACTION_KEY_HELP: &str =
     "n new  x close  r rename  p save  I import  X export  R run  e cycle  E envs";
 /// Always-visible legacy control shortcut help.
 const CONTROL_KEY_HELP: &str =
-    "^S send ^P save ^L import ^X export ^G run ^T new ^W close ^R ren ^O side";
+    "^S send ^P save ^L import ^X export ^G run ^B body ^T new ^W close ^R ren ^O side";
 
 /// Operating-system family used to label visible key help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,8 +692,12 @@ fn render_headers(frame: &mut Frame, app: &App, area: Rect) {
 /// Renders the request body editor.
 fn render_body(frame: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Body;
+    let title = format!(
+        " Body  [{}]  (Ctrl+B mode) ",
+        app.current_body_mode().label()
+    );
     let block = Block::default()
-        .title(" Body ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style(focused));
 
@@ -1977,7 +1981,7 @@ mod tests {
     use spark_core::{
         config::Config,
         history::HistoryEntry,
-        http::{HttpMethod, HttpRequest, HttpResponse, RequestAuth, RequestScripts},
+        http::{BodyMode, HttpMethod, HttpRequest, HttpResponse, RequestAuth, RequestScripts},
     };
 
     use crate::app::{App, ResponseTab};
@@ -2235,6 +2239,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
 

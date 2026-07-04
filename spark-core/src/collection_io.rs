@@ -1,7 +1,7 @@
 //! Import and export for saved request collections.
 
 use crate::{
-    http::{ApiKeyLocation, HttpMethod, QueryParam, RequestAuth, RequestScripts},
+    http::{ApiKeyLocation, BodyMode, HttpMethod, QueryParam, RequestAuth, RequestScripts},
     saved::{DEFAULT_COLLECTION, SavedRequest, write_saved_requests},
 };
 use anyhow::{Context, anyhow};
@@ -190,11 +190,7 @@ fn collect_postman_items(
         let query_params = postman_query_params(request_value.get("url"));
         let auth = postman_auth(request_value.get("auth"));
         let scripts = postman_scripts(item.get("event"));
-        let body = request_value
-            .pointer("/body/raw")
-            .and_then(Value::as_str)
-            .filter(|body| !body.trim().is_empty())
-            .map(ToString::to_string);
+        let (body, body_mode) = postman_body(request_value.get("body"));
 
         requests.push(SavedRequest {
             name: name.to_string(),
@@ -206,10 +202,78 @@ fn collect_postman_items(
             auth,
             headers,
             body,
+            body_mode,
             scripts,
             updated_at: Utc::now(),
         });
     }
+}
+
+/// Extracts body content and mode from a Postman request body object.
+fn postman_body(value: Option<&Value>) -> (Option<String>, BodyMode) {
+    let Some(value) = value else {
+        return (None, BodyMode::Raw);
+    };
+    match value.get("mode").and_then(Value::as_str) {
+        Some("formdata") => (
+            postman_body_fields(value.get("formdata"), true),
+            BodyMode::FormData,
+        ),
+        Some("urlencoded") => (
+            postman_body_fields(value.get("urlencoded"), false),
+            BodyMode::UrlEncoded,
+        ),
+        _ => (
+            value
+                .get("raw")
+                .and_then(Value::as_str)
+                .filter(|body| !body.trim().is_empty())
+                .map(ToString::to_string),
+            BodyMode::Raw,
+        ),
+    }
+}
+
+/// Formats Postman key-value body arrays for the Spark body editor.
+fn postman_body_fields(value: Option<&Value>, allow_files: bool) -> Option<String> {
+    let lines = value
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |fields| {
+            fields
+                .iter()
+                .filter(|field| {
+                    !field
+                        .get("disabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .filter_map(|field| postman_body_field(field, allow_files))
+                .collect::<Vec<_>>()
+        });
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Formats one Postman body field for the Spark body editor.
+fn postman_body_field(value: &Value, allow_files: bool) -> Option<String> {
+    let key = value.get("key")?.as_str()?.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let field_type = value.get("type").and_then(Value::as_str);
+    if allow_files && field_type == Some("file") {
+        let path = value
+            .get("src")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("value").and_then(Value::as_str))?
+            .trim();
+        return (!path.is_empty()).then(|| format!("{key}=@{path}"));
+    }
+    let field_value = value
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    Some(format!("{key}={field_value}"))
 }
 
 /// Extracts pre-request and test scripts from Postman item events.
@@ -407,6 +471,7 @@ fn import_openapi(value: &Value) -> anyhow::Result<Vec<SavedRequest>> {
                 auth: RequestAuth::None,
                 headers,
                 body,
+                body_mode: BodyMode::Raw,
                 scripts: RequestScripts::default(),
                 updated_at: Utc::now(),
             });
@@ -528,12 +593,9 @@ fn postman_request_item(request: &SavedRequest) -> Value {
         }
     });
     if let Some(body) = &request.body
-        && !body.trim().is_empty()
+        && let Some(body_value) = postman_request_body(request.body_mode, body)
     {
-        request_value["body"] = json!({
-            "mode": "raw",
-            "raw": body,
-        });
+        request_value["body"] = body_value;
     }
     if !request.query_params.is_empty() {
         request_value["url"]["query"] = json!(
@@ -563,6 +625,60 @@ fn postman_request_item(request: &SavedRequest) -> Value {
         item["event"] = Value::Array(events);
     }
     item
+}
+
+/// Builds a Postman request body object from a saved request body.
+fn postman_request_body(mode: BodyMode, body: &str) -> Option<Value> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    match mode {
+        BodyMode::Raw | BodyMode::BinaryFile => Some(json!({
+            "mode": "raw",
+            "raw": body,
+        })),
+        BodyMode::FormData => Some(json!({
+            "mode": "formdata",
+            "formdata": spark_body_fields(body, true),
+        })),
+        BodyMode::UrlEncoded => Some(json!({
+            "mode": "urlencoded",
+            "urlencoded": spark_body_fields(body, false),
+        })),
+    }
+}
+
+/// Builds Postman body field objects from Spark body editor lines.
+fn spark_body_fields(body: &str, allow_files: bool) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| spark_body_field(line, allow_files))
+        .collect()
+}
+
+/// Builds one Postman body field object from a Spark body editor line.
+fn spark_body_field(line: &str, allow_files: bool) -> Option<Value> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let value = value.trim();
+    if allow_files && let Some(path) = value.strip_prefix('@').map(str::trim) {
+        return Some(json!({
+            "key": key,
+            "type": "file",
+            "src": path,
+        }));
+    }
+    Some(json!({
+        "key": key,
+        "type": "text",
+        "value": value,
+    }))
 }
 
 /// Converts Spark scripts into Postman event values.
@@ -763,6 +879,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: vec![("Authorization".to_string(), "Bearer token".to_string())],
             body: Some("{\"name\":\"Ada\"}".to_string()),
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
             updated_at: Utc::now(),
         }
@@ -836,6 +953,57 @@ mod tests {
             "set trace={{trace_id}}\nheader X-Trace: {{trace}}"
         );
         assert_eq!(imported[0].scripts.tests, "status 201\nbody contains Ada");
+        assert_eq!(imported[0].body_mode, BodyMode::Raw);
+    }
+
+    /// Imports Postman form-data and URL-encoded body modes.
+    #[test]
+    fn imports_postman_structured_body_modes() {
+        let content = r#"{
+          "info": {"name": "Uploads"},
+          "item": [
+            {
+              "name": "Upload avatar",
+              "request": {
+                "method": "POST",
+                "url": "https://api.example.com/avatar",
+                "body": {
+                  "mode": "formdata",
+                  "formdata": [
+                    {"key":"name","value":"Ada","type":"text"},
+                    {"key":"avatar","src":"/tmp/avatar.png","type":"file"}
+                  ]
+                }
+              }
+            },
+            {
+              "name": "Create token",
+              "request": {
+                "method": "POST",
+                "url": "https://api.example.com/token",
+                "body": {
+                  "mode": "urlencoded",
+                  "urlencoded": [
+                    {"key":"grant_type","value":"client_credentials","type":"text"}
+                  ]
+                }
+              }
+            }
+          ]
+        }"#;
+
+        let imported = import_collection_str(content, None).expect("Postman should import");
+
+        assert_eq!(imported[0].body_mode, BodyMode::FormData);
+        assert_eq!(
+            imported[0].body.as_deref(),
+            Some("name=Ada\navatar=@/tmp/avatar.png")
+        );
+        assert_eq!(imported[1].body_mode, BodyMode::UrlEncoded);
+        assert_eq!(
+            imported[1].body.as_deref(),
+            Some("grant_type=client_credentials")
+        );
     }
 
     /// Imports an `OpenAPI` operation with a server URL and tag.
@@ -931,6 +1099,39 @@ mod tests {
                 .pointer("/item/0/item/0/item/0/event/1/script/exec/0")
                 .and_then(Value::as_str),
             Some("status 2xx")
+        );
+    }
+
+    /// Exports structured body modes as Postman body arrays.
+    #[test]
+    fn exports_postman_structured_body_modes() {
+        let mut request = saved_request(
+            "Upload avatar",
+            HttpMethod::Post,
+            "https://api.example.com/avatar",
+        );
+        request.body_mode = BodyMode::FormData;
+        request.body = Some("name=Ada\navatar=@/tmp/avatar.png".to_string());
+
+        let exported = export_postman(&[request]);
+
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/request/body/mode")
+                .and_then(Value::as_str),
+            Some("formdata")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/request/body/formdata/1/type")
+                .and_then(Value::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            exported
+                .pointer("/item/0/item/0/item/0/request/body/formdata/1/src")
+                .and_then(Value::as_str),
+            Some("/tmp/avatar.png")
         );
     }
 

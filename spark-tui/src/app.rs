@@ -9,7 +9,7 @@ use spark_core::{
     environment::{Environment, load_environments, resolve_template, write_environments},
     history::{HistoryEntry, append_history, load_history},
     http::{
-        ApiKeyLocation, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth,
+        ApiKeyLocation, BodyMode, HttpMethod, HttpRequest, HttpResponse, QueryParam, RequestAuth,
         RequestScripts,
     },
     saved::{
@@ -592,6 +592,8 @@ pub struct RequestTab {
     pub headers: TextInput,
     /// Body editor for this tab.
     pub body: TextInput,
+    /// Selected request body mode.
+    pub body_mode_index: usize,
     /// Pre-request script editor for this tab.
     pub pre_request_script: TextInput,
     /// Response test script editor for this tab.
@@ -617,6 +619,7 @@ impl RequestTab {
             auth: TextInput::multi_line(),
             headers: TextInput::multi_line(),
             body: TextInput::multi_line(),
+            body_mode_index: 0,
             pre_request_script: TextInput::multi_line(),
             test_script: TextInput::multi_line(),
             response: None,
@@ -841,6 +844,7 @@ impl App {
             KeyCode::Char('t') => self.open_new_request_tab(),
             KeyCode::Char('w') => self.close_active_request_tab(),
             KeyCode::Char('r') => self.open_rename_tab_dialog(),
+            KeyCode::Char('b') => self.select_next_body_mode(),
             KeyCode::Left => self.select_previous_request_tab(),
             KeyCode::Right => self.select_next_request_tab(),
             KeyCode::Char('o') => self.toggle_sidebar_mode(),
@@ -927,6 +931,12 @@ impl App {
     /// Returns the currently selected [`HttpMethod`].
     pub fn current_method(&self) -> &HttpMethod {
         &HttpMethod::all()[self.active_tab().method_index]
+    }
+
+    /// Returns the currently selected request body mode.
+    #[must_use]
+    pub fn current_body_mode(&self) -> BodyMode {
+        BodyMode::all()[self.active_tab().body_mode_index]
     }
 
     /// Returns whether a request is queued or currently being started.
@@ -1384,6 +1394,7 @@ impl App {
         let auth_text = format_auth(&entry.auth);
         let headers_text = format_headers(&entry.headers);
         let body_text = entry.body.clone().unwrap_or_default();
+        let body_mode = entry.body_mode;
         let pre_request_script = entry.scripts.pre_request.clone();
         let test_script = entry.scripts.tests.clone();
 
@@ -1396,6 +1407,7 @@ impl App {
         self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
+        self.active_tab_mut().body_mode_index = body_mode_index(body_mode);
         self.active_tab_mut()
             .pre_request_script
             .set_content(&pre_request_script);
@@ -1428,6 +1440,7 @@ impl App {
         let auth_text = format_auth(&request.auth);
         let headers_text = format_headers(&request.headers);
         let body_text = request.body.clone().unwrap_or_default();
+        let body_mode = request.body_mode;
         let pre_request_script = request.scripts.pre_request.clone();
         let test_script = request.scripts.tests.clone();
 
@@ -1440,6 +1453,7 @@ impl App {
         self.active_tab_mut().auth.set_content(&auth_text);
         self.active_tab_mut().headers.set_content(&headers_text);
         self.active_tab_mut().body.set_content(&body_text);
+        self.active_tab_mut().body_mode_index = body_mode_index(body_mode);
         self.active_tab_mut()
             .pre_request_script
             .set_content(&pre_request_script);
@@ -1945,6 +1959,7 @@ impl App {
         let headers_text = tab.headers.text();
         let headers = parse_headers(headers_text.as_ref());
         let body_text = tab.body.text();
+        let body_mode = self.current_body_mode();
         let body = if body_text.trim().is_empty() {
             None
         } else {
@@ -1960,6 +1975,7 @@ impl App {
             auth,
             headers,
             body,
+            body_mode,
             scripts: RequestScripts {
                 pre_request: pre_request_script,
                 tests: test_script,
@@ -2090,6 +2106,7 @@ impl App {
             auth: saved.auth.clone(),
             headers: saved.headers.clone(),
             body: saved.body.clone(),
+            body_mode: saved.body_mode,
             scripts: saved.scripts.clone(),
         };
         let pre_request =
@@ -2143,6 +2160,7 @@ impl App {
             auth,
             headers,
             body,
+            body_mode: request.body_mode,
             scripts: request.scripts.clone(),
         })
     }
@@ -2253,6 +2271,14 @@ impl App {
         let count = HttpMethod::all().len();
         let tab = self.active_tab_mut();
         tab.method_index = (tab.method_index + 1) % count;
+    }
+
+    /// Selects the next request body mode.
+    fn select_next_body_mode(&mut self) {
+        let count = BodyMode::all().len();
+        let tab = self.active_tab_mut();
+        tab.body_mode_index = (tab.body_mode_index + 1) % count;
+        self.status_message = format!("Body mode: {}", self.current_body_mode().label());
     }
 
     /// Selects the next response pane tab.
@@ -2730,6 +2756,14 @@ fn format_auth(auth: &RequestAuth) -> String {
     }
 }
 
+/// Returns the body mode index used by request tabs.
+fn body_mode_index(mode: BodyMode) -> usize {
+    BodyMode::all()
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or_default()
+}
+
 /// Resolves auth helper templates using the active environment.
 fn resolve_auth_template(
     auth: &RequestAuth,
@@ -3028,6 +3062,7 @@ mod tests {
             auth: RequestAuth::None,
             headers,
             body: body.map(ToString::to_string),
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         })
     }
@@ -3046,6 +3081,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: body.map(ToString::to_string),
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
         let mut saved = SavedRequest::from_request(&request);
@@ -3179,6 +3215,68 @@ mod tests {
             }),
             "api-key-header key=X-API-Key value={{api_key}}"
         );
+    }
+
+    /// Ctrl+B cycles request body modes without changing body text.
+    #[test]
+    fn ctrl_b_cycles_body_modes() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut().body.set_content("name=Ada");
+
+        app.handle_key(ctrl_key(KeyCode::Char('b')));
+
+        assert_eq!(app.current_body_mode(), BodyMode::FormData);
+        assert_eq!(app.active_tab().body.content(), "name=Ada");
+        assert_eq!(app.status_message, "Body mode: Form Data");
+
+        app.handle_key(ctrl_key(KeyCode::Char('b')));
+
+        assert_eq!(app.current_body_mode(), BodyMode::UrlEncoded);
+    }
+
+    /// URL encoded body mode is included in the queued request template.
+    #[test]
+    fn send_request_preserves_url_encoded_body_mode() {
+        let mut app = app_with_history(Vec::new());
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/users");
+        app.active_tab_mut().body_mode_index = body_mode_index(BodyMode::UrlEncoded);
+        app.active_tab_mut().body.set_content("name=Ada Lovelace");
+
+        app.send_request();
+
+        let request = app
+            .pending_request
+            .as_ref()
+            .expect("request should be queued");
+        assert_eq!(request.request.body_mode, BodyMode::UrlEncoded);
+        assert_eq!(request.request.body.as_deref(), Some("name=Ada Lovelace"));
+    }
+
+    /// Binary file body paths are resolved through the active environment.
+    #[test]
+    fn send_request_resolves_binary_file_body_path() {
+        let mut app = app_with_history(Vec::new());
+        app.environments = vec![Environment {
+            name: "Files".to_string(),
+            variables: vec![("upload_path".to_string(), "/tmp/avatar.png".to_string())],
+        }];
+        app.environment_index = Some(0);
+        app.active_tab_mut()
+            .url
+            .set_content("https://example.com/upload");
+        app.active_tab_mut().body_mode_index = body_mode_index(BodyMode::BinaryFile);
+        app.active_tab_mut().body.set_content("{{upload_path}}");
+
+        app.send_request();
+
+        let request = app
+            .pending_request
+            .as_ref()
+            .expect("request should be queued");
+        assert_eq!(request.request.body_mode, BodyMode::BinaryFile);
+        assert_eq!(request.request.body.as_deref(), Some("/tmp/avatar.png"));
     }
 
     /// Empty search returns every history entry.
@@ -3896,6 +3994,10 @@ mod tests {
         app.active_tab_mut()
             .pre_request_script
             .set_content("set user_id=42");
+        app.active_tab_mut().body_mode_index = body_mode_index(BodyMode::FormData);
+        app.active_tab_mut()
+            .body
+            .set_content("avatar=@/tmp/avatar.png");
         app.active_tab_mut().test_script.set_content("status 2xx");
 
         app.save_current_request_to(DEFAULT_COLLECTION.to_string(), None);
@@ -3919,6 +4021,11 @@ mod tests {
             RequestAuth::Bearer {
                 token: "{{token}}".to_string(),
             }
+        );
+        assert_eq!(app.saved_requests[0].body_mode, BodyMode::FormData);
+        assert_eq!(
+            app.saved_requests[0].body.as_deref(),
+            Some("avatar=@/tmp/avatar.png")
         );
         assert_eq!(app.saved_requests[0].scripts.pre_request, "set user_id=42");
         assert_eq!(app.saved_requests[0].scripts.tests, "status 2xx");
@@ -4026,6 +4133,7 @@ mod tests {
         saved.auth = RequestAuth::Bearer {
             token: "{{token}}".to_string(),
         };
+        saved.body_mode = BodyMode::UrlEncoded;
         saved.scripts = RequestScripts {
             pre_request: "set order_id=42".to_string(),
             tests: "status 200".to_string(),
@@ -4039,6 +4147,7 @@ mod tests {
         assert_eq!(app.active_tab().params.content(), "status=pending");
         assert_eq!(app.active_tab().auth.content(), "bearer token={{token}}");
         assert_eq!(app.active_tab().body.content(), "{\"status\":\"pending\"}");
+        assert_eq!(app.current_body_mode(), BodyMode::UrlEncoded);
         assert_eq!(
             app.active_tab().pre_request_script.content(),
             "set order_id=42"

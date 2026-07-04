@@ -1,6 +1,6 @@
 //! Saved request persistence in JSON format.
 
-use crate::http::{HttpMethod, HttpRequest, QueryParam, RequestAuth, RequestScripts};
+use crate::http::{BodyMode, HttpMethod, HttpRequest, QueryParam, RequestAuth, RequestScripts};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -39,6 +39,9 @@ pub struct SavedRequest {
     pub headers: Vec<(String, String)>,
     /// Request body, if any should be sent.
     pub body: Option<String>,
+    /// Mode used to interpret the request body.
+    #[serde(default)]
+    pub body_mode: BodyMode,
     /// Pre-request and response test scripts.
     #[serde(default)]
     pub scripts: RequestScripts,
@@ -60,6 +63,7 @@ impl SavedRequest {
             auth: req.auth.clone(),
             headers: req.headers.clone(),
             body: req.body.clone(),
+            body_mode: req.body_mode,
             scripts: req.scripts.clone(),
             updated_at: Utc::now(),
         }
@@ -181,6 +185,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
             updated_at: Utc::now(),
         }
@@ -246,6 +251,7 @@ mod tests {
 
         assert_eq!(request.collection, DEFAULT_COLLECTION);
         assert_eq!(request.folder, None);
+        assert_eq!(request.body_mode, BodyMode::Raw);
     }
 
     /// Removing an existing request rewrites the collection.

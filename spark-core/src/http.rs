@@ -141,6 +141,44 @@ pub struct RequestScripts {
     pub tests: String,
 }
 
+/// How a request body should be interpreted and sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BodyMode {
+    /// Send the body editor content exactly as typed.
+    #[default]
+    Raw,
+    /// Send editor lines as multipart form fields.
+    FormData,
+    /// Send editor lines as URL-encoded fields.
+    UrlEncoded,
+    /// Treat the body editor content as a file path and upload file bytes.
+    BinaryFile,
+}
+
+impl BodyMode {
+    /// Returns all body modes in display order.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::Raw,
+            Self::FormData,
+            Self::UrlEncoded,
+            Self::BinaryFile,
+        ]
+    }
+
+    /// Returns a compact display label for this mode.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "Raw",
+            Self::FormData => "Form Data",
+            Self::UrlEncoded => "URL Encoded",
+            Self::BinaryFile => "Binary File",
+        }
+    }
+}
+
 /// An outgoing HTTP request.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
@@ -156,6 +194,8 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     /// Optional request body.
     pub body: Option<String>,
+    /// Mode used to interpret the request body.
+    pub body_mode: BodyMode,
     /// Pre-request and response test scripts.
     pub scripts: RequestScripts,
 }
@@ -195,10 +235,31 @@ impl HttpRequest {
             cmd.arg("-H").arg(format!("{key}: {value}"));
         }
 
-        if let Some(body) = &self.body
-            && !body.is_empty()
-        {
-            cmd.arg("-d").arg(body);
+        match self.body_payload() {
+            BodyPayload::None => {}
+            BodyPayload::Raw(body) => {
+                cmd.arg("-d").arg(body);
+            }
+            BodyPayload::UrlEncoded(fields) => {
+                for (key, value) in fields {
+                    cmd.arg("--data-urlencode").arg(format!("{key}={value}"));
+                }
+            }
+            BodyPayload::FormData(fields) => {
+                for field in fields {
+                    match field {
+                        FormField::Text { key, value } => {
+                            cmd.arg("-F").arg(format!("{key}={value}"));
+                        }
+                        FormField::File { key, path } => {
+                            cmd.arg("-F").arg(format!("{key}=@{path}"));
+                        }
+                    }
+                }
+            }
+            BodyPayload::BinaryFile(path) => {
+                cmd.arg("--data-binary").arg(format!("@{path}"));
+            }
         }
 
         let start = std::time::Instant::now();
@@ -279,6 +340,129 @@ impl HttpRequest {
             _ => Vec::new(),
         }
     }
+
+    /// Converts the body fields into executable curl arguments.
+    fn body_payload(&self) -> BodyPayload {
+        let Some(body) = self
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|body| !body.is_empty())
+        else {
+            return BodyPayload::None;
+        };
+
+        match self.body_mode {
+            BodyMode::Raw => BodyPayload::Raw(body.to_string()),
+            BodyMode::UrlEncoded => {
+                let fields = parse_body_fields(body)
+                    .into_iter()
+                    .map(|field| (field.key, field.value))
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    BodyPayload::None
+                } else {
+                    BodyPayload::UrlEncoded(fields)
+                }
+            }
+            BodyMode::FormData => {
+                let fields = parse_body_fields(body)
+                    .into_iter()
+                    .map(|field| {
+                        if field.file {
+                            FormField::File {
+                                key: field.key,
+                                path: field.value,
+                            }
+                        } else {
+                            FormField::Text {
+                                key: field.key,
+                                value: field.value,
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if fields.is_empty() {
+                    BodyPayload::None
+                } else {
+                    BodyPayload::FormData(fields)
+                }
+            }
+            BodyMode::BinaryFile => BodyPayload::BinaryFile(body.to_string()),
+        }
+    }
+}
+
+/// Curl-ready request body payload.
+enum BodyPayload {
+    /// No body should be sent.
+    None,
+    /// Raw body string.
+    Raw(String),
+    /// URL encoded key-value fields.
+    UrlEncoded(Vec<(String, String)>),
+    /// Multipart form fields.
+    FormData(Vec<FormField>),
+    /// File path used for binary upload.
+    BinaryFile(String),
+}
+
+/// One multipart form field.
+enum FormField {
+    /// Text form value.
+    Text {
+        /// Field name.
+        key: String,
+        /// Field value.
+        value: String,
+    },
+    /// File form value.
+    File {
+        /// Field name.
+        key: String,
+        /// File path.
+        path: String,
+    },
+}
+
+/// Parsed body editor field.
+struct BodyField {
+    /// Field name.
+    key: String,
+    /// Field value or path.
+    value: String,
+    /// Whether the value should be sent as a file field.
+    file: bool,
+}
+
+/// Parses key-value body editor lines.
+fn parse_body_fields(text: &str) -> Vec<BodyField> {
+    text.lines().filter_map(parse_body_field_line).collect()
+}
+
+/// Parses one body editor field line.
+fn parse_body_field_line(line: &str) -> Option<BodyField> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+
+    let value = value.trim();
+    let (file, value) = value
+        .strip_prefix('@')
+        .map_or((false, value), |path| (true, path.trim()));
+
+    Some(BodyField {
+        key: key.to_string(),
+        value: value.to_string(),
+        file,
+    })
 }
 
 /// Base64 alphabet for HTTP Basic credentials.
@@ -433,6 +617,7 @@ mod tests {
             auth: RequestAuth::None,
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
 
@@ -457,6 +642,7 @@ mod tests {
                 ("Accept".to_string(), "application/json".to_string()),
             ],
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
 
@@ -482,6 +668,7 @@ mod tests {
             },
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
 
@@ -508,6 +695,7 @@ mod tests {
             },
             headers: Vec::new(),
             body: None,
+            body_mode: BodyMode::Raw,
             scripts: RequestScripts::default(),
         };
 
@@ -515,5 +703,19 @@ mod tests {
             request.url_with_query_params(),
             "https://example.com/search?api_key=abc%20123"
         );
+    }
+
+    /// Body field lines parse text and file values.
+    #[test]
+    fn body_fields_parse_text_and_file_values() {
+        let fields = parse_body_fields("name=Ada\navatar=@/tmp/avatar.png\n# skip=true");
+
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].key, "name");
+        assert_eq!(fields[0].value, "Ada");
+        assert!(!fields[0].file);
+        assert_eq!(fields[1].key, "avatar");
+        assert_eq!(fields[1].value, "/tmp/avatar.png");
+        assert!(fields[1].file);
     }
 }

@@ -64,6 +64,8 @@ pub enum ResponseTab {
     Sizes,
     /// Shows response code distribution across history.
     History,
+    /// Shows the most recent collection runner results.
+    Runner,
 }
 
 impl ResponseTab {
@@ -77,6 +79,7 @@ impl ResponseTab {
             Self::Trace,
             Self::Sizes,
             Self::History,
+            Self::Runner,
         ]
     }
 
@@ -90,6 +93,7 @@ impl ResponseTab {
             Self::Trace => "Trace",
             Self::Sizes => "Sizes",
             Self::History => "History",
+            Self::Runner => "Runner",
         }
     }
 
@@ -105,6 +109,114 @@ impl ResponseTab {
         let tabs = Self::all();
         let current = tabs.iter().position(|tab| *tab == self).unwrap_or_default();
         tabs[(current + tabs.len() - 1) % tabs.len()]
+    }
+}
+
+/// Saved request group selected for a collection runner execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRunTarget {
+    /// Collection name to run.
+    pub collection: String,
+    /// Optional folder inside the selected collection.
+    pub folder: Option<String>,
+}
+
+impl CollectionRunTarget {
+    /// Returns a display label for this runner target.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.folder.as_ref().map_or_else(
+            || self.collection.clone(),
+            |folder| format!("{}/{folder}", self.collection),
+        )
+    }
+}
+
+/// One completed collection runner request result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRunResult {
+    /// Saved request name.
+    pub name: String,
+    /// HTTP method used by the resolved request.
+    pub method: HttpMethod,
+    /// Resolved request URL.
+    pub url: String,
+    /// Response status code, when a response was received.
+    pub status_code: Option<u16>,
+    /// Round-trip duration in milliseconds, when a response was received.
+    pub duration_ms: Option<u128>,
+    /// Number of response tests that passed.
+    pub tests_passed: usize,
+    /// Number of response tests that ran.
+    pub tests_total: usize,
+    /// Error message for failed request setup or execution.
+    pub error: Option<String>,
+}
+
+impl CollectionRunResult {
+    /// Returns whether this result counts as a passed runner item.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        if self.tests_total > 0 {
+            return self.tests_passed == self.tests_total;
+        }
+        self.status_code.is_some_and(|code| code < 400)
+    }
+}
+
+/// State for the active or most recent collection runner execution.
+#[derive(Debug, Clone)]
+pub struct CollectionRun {
+    /// Selected collection or folder target.
+    pub target: CollectionRunTarget,
+    /// Saved request indexes still waiting to run.
+    queue: Vec<usize>,
+    /// Total number of requests selected for the run.
+    pub total: usize,
+    /// Name of the request currently executing.
+    pub current_request: Option<String>,
+    /// Completed request results.
+    pub results: Vec<CollectionRunResult>,
+}
+
+impl CollectionRun {
+    /// Creates a collection run from saved request indexes.
+    fn new(target: CollectionRunTarget, queue: Vec<usize>) -> Self {
+        let total = queue.len();
+        Self {
+            target,
+            queue,
+            total,
+            current_request: None,
+            results: Vec::new(),
+        }
+    }
+
+    /// Returns number of completed requests.
+    #[must_use]
+    pub fn completed(&self) -> usize {
+        self.results.len()
+    }
+
+    /// Returns number of passed requests.
+    #[must_use]
+    pub fn passed(&self) -> usize {
+        self.results.iter().filter(|result| result.passed()).count()
+    }
+
+    /// Returns number of failed requests.
+    #[must_use]
+    pub fn failed(&self) -> usize {
+        self.completed().saturating_sub(self.passed())
+    }
+
+    /// Returns whether there are queued or currently executing requests.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.current_request.is_some() || self.completed() < self.total
     }
 }
 
@@ -446,6 +558,8 @@ struct PendingRequest {
     tab_index: usize,
     /// Fully resolved request ready for execution.
     request: HttpRequest,
+    /// Saved request name when this pending request belongs to the collection runner.
+    runner_request_name: Option<String>,
 }
 
 /// Complete application state.
@@ -482,6 +596,8 @@ pub struct App {
     pub rename_tab_dialog: Option<RenameTabDialog>,
     /// Active collection import/export dialog.
     pub collection_io_dialog: Option<CollectionIoDialog>,
+    /// Active or most recent collection runner state.
+    pub collection_run: Option<CollectionRun>,
     /// Request waiting for a painted "sending" frame before execution.
     pending_request: Option<PendingRequest>,
     /// Set to `true` to exit the event loop.
@@ -516,6 +632,7 @@ impl App {
             save_dialog: None,
             rename_tab_dialog: None,
             collection_io_dialog: None,
+            collection_run: None,
             pending_request: None,
             should_quit: false,
             status_message: "Ready.".to_string(),
@@ -601,6 +718,10 @@ impl App {
                 }
                 KeyCode::Char('x') => {
                     self.open_collection_io_dialog(CollectionIoMode::Export);
+                    return;
+                }
+                KeyCode::Char('g') => {
+                    self.start_collection_run_from_selection();
                     return;
                 }
                 KeyCode::Char('t') => {
@@ -699,6 +820,10 @@ impl App {
                 self.open_collection_io_dialog(CollectionIoMode::Export);
                 true
             }
+            KeyCode::Char('R') => {
+                self.start_collection_run_from_selection();
+                true
+            }
             KeyCode::Char('e') => {
                 self.select_next_environment();
                 true
@@ -741,6 +866,18 @@ impl App {
         self.pending_request
             .as_ref()
             .is_some_and(|pending| pending.tab_index == tab_index)
+    }
+
+    /// Returns whether the collection runner has a request queued or executing.
+    #[must_use]
+    pub fn is_collection_run_active(&self) -> bool {
+        self.pending_request
+            .as_ref()
+            .is_some_and(|pending| pending.runner_request_name.is_some())
+            || self
+                .collection_run
+                .as_ref()
+                .is_some_and(CollectionRun::is_running)
     }
 
     /// Returns the currently active request tab.
@@ -1449,7 +1586,11 @@ impl App {
         tab.response_tab = ResponseTab::Body;
         tab.response_scroll = 0;
         self.status_message = format!("Sending {} {}…", request.method, request.url);
-        self.pending_request = Some(PendingRequest { tab_index, request });
+        self.pending_request = Some(PendingRequest {
+            tab_index,
+            request,
+            runner_request_name: None,
+        });
     }
 
     /// Executes a queued request, writing the result to history.
@@ -1463,8 +1604,21 @@ impl App {
                 let entry = HistoryEntry::from_response(&request, response.status_code);
                 let _ = append_history(&self.config.history_file, &entry);
                 let test_results = run_test_script(&request.scripts.tests, &response);
-                self.status_message =
-                    request_status_message(&request, response.status_code, &test_results);
+                if let Some(name) = &pending.runner_request_name {
+                    self.complete_collection_run_request(CollectionRunResult {
+                        name: name.clone(),
+                        method: request.method,
+                        url: request.url.clone(),
+                        status_code: Some(response.status_code),
+                        duration_ms: Some(response.duration_ms),
+                        tests_passed: test_results.iter().filter(|test| test.passed).count(),
+                        tests_total: test_results.len(),
+                        error: None,
+                    });
+                } else {
+                    self.status_message =
+                        request_status_message(&request, response.status_code, &test_results);
+                }
                 self.history.push(entry);
                 self.history_index = self.history.len() - 1;
                 self.select_latest_visible_sidebar_item();
@@ -1474,8 +1628,30 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status_message = format!("Error: {e}");
+                if let Some(name) = pending.runner_request_name {
+                    self.complete_collection_run_request(CollectionRunResult {
+                        name,
+                        method: request.method,
+                        url: request.url,
+                        status_code: None,
+                        duration_ms: None,
+                        tests_passed: 0,
+                        tests_total: 0,
+                        error: Some(e.to_string()),
+                    });
+                } else {
+                    self.status_message = format!("Error: {e}");
+                }
             }
+        }
+
+        if self
+            .collection_run
+            .as_ref()
+            .is_some_and(CollectionRun::is_running)
+            && self.pending_request.is_none()
+        {
+            self.queue_next_collection_run_request();
         }
     }
 
@@ -1528,6 +1704,127 @@ impl App {
         }
 
         (DEFAULT_COLLECTION.to_string(), None)
+    }
+
+    /// Starts a collection runner execution from the current saved sidebar selection.
+    fn start_collection_run_from_selection(&mut self) {
+        let Some(target) = self.selected_collection_run_target() else {
+            self.status_message =
+                "Select a saved request to run its folder or collection.".to_string();
+            return;
+        };
+        let queue = self.saved_request_indices_for_target(&target);
+        if queue.is_empty() {
+            self.status_message = format!("No saved requests found for {}", target.label());
+            return;
+        }
+
+        let total = queue.len();
+        self.method_dropdown_open = false;
+        self.focus = Focus::Response;
+        self.active_tab_mut().response_tab = ResponseTab::Runner;
+        self.active_tab_mut().response_scroll = 0;
+        self.pending_request = None;
+        self.collection_run = Some(CollectionRun::new(target.clone(), queue));
+        self.status_message = format!("Running {} saved requests in {}", total, target.label());
+        self.queue_next_collection_run_request();
+    }
+
+    /// Returns the runner target implied by the selected saved request.
+    fn selected_collection_run_target(&self) -> Option<CollectionRunTarget> {
+        if self.sidebar_mode != SidebarMode::Saved {
+            return None;
+        }
+        if !self.filtered_saved_indices().contains(&self.saved_index) {
+            return None;
+        }
+        let request = self.saved_requests.get(self.saved_index)?;
+        Some(CollectionRunTarget {
+            collection: request.collection.clone(),
+            folder: request.folder.clone(),
+        })
+    }
+
+    /// Returns saved request indexes included in a runner target.
+    fn saved_request_indices_for_target(&self, target: &CollectionRunTarget) -> Vec<usize> {
+        self.saved_requests
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, request)| saved_request_is_in_target(request, target).then_some(idx))
+            .collect()
+    }
+
+    /// Queues the next collection runner request, or finalizes the run.
+    fn queue_next_collection_run_request(&mut self) {
+        let Some(run) = &mut self.collection_run else {
+            return;
+        };
+        let Some(saved_index) = run.queue.first().copied() else {
+            run.current_request = None;
+            self.status_message = collection_run_status_message(run);
+            return;
+        };
+        run.queue.remove(0);
+
+        let Some(saved) = self.saved_requests.get(saved_index).cloned() else {
+            return;
+        };
+        let request_name = saved.name.clone();
+        if let Some(run) = &mut self.collection_run {
+            run.current_request = Some(request_name.clone());
+        }
+
+        match self.resolved_saved_request(&saved) {
+            Ok(request) => {
+                self.status_message = format!("Running {}: {}", saved.name, request.url);
+                self.pending_request = Some(PendingRequest {
+                    tab_index: self.active_request_tab,
+                    request,
+                    runner_request_name: Some(request_name),
+                });
+            }
+            Err(error) => {
+                self.complete_collection_run_request(CollectionRunResult {
+                    name: request_name,
+                    method: saved.method,
+                    url: saved.url,
+                    status_code: None,
+                    duration_ms: None,
+                    tests_passed: 0,
+                    tests_total: 0,
+                    error: Some(error),
+                });
+                self.queue_next_collection_run_request();
+            }
+        }
+    }
+
+    /// Records one collection runner result.
+    fn complete_collection_run_request(&mut self, result: CollectionRunResult) {
+        if let Some(run) = &mut self.collection_run {
+            run.current_request = None;
+            run.results.push(result);
+            self.status_message = collection_run_status_message(run);
+        }
+    }
+
+    /// Builds a resolved request from a saved request template.
+    fn resolved_saved_request(&self, saved: &SavedRequest) -> Result<HttpRequest, String> {
+        let mut template = HttpRequest {
+            method: saved.method,
+            url: saved.url.clone(),
+            query_params: saved.query_params.clone(),
+            auth: saved.auth.clone(),
+            headers: saved.headers.clone(),
+            body: saved.body.clone(),
+            scripts: saved.scripts.clone(),
+        };
+        let pre_request =
+            run_pre_request_script(&template.scripts.pre_request, self.active_environment())?;
+        template.query_params.extend(pre_request.query_params);
+        template.headers.extend(pre_request.headers);
+        let environment = merged_environment(self.active_environment(), &pre_request.variables);
+        Self::resolve_request_template(&template, environment.as_ref())
     }
 
     /// Resolves environment variables in a request template.
@@ -2298,6 +2595,32 @@ fn saved_location_label(request: &SavedRequest) -> String {
     request.folder.as_ref().map_or_else(
         || request.collection.clone(),
         |folder| format!("{}/{folder}", request.collection),
+    )
+}
+
+/// Returns whether a saved request belongs to a collection runner target.
+fn saved_request_is_in_target(request: &SavedRequest, target: &CollectionRunTarget) -> bool {
+    request.collection == target.collection
+        && target
+            .folder
+            .as_ref()
+            .is_none_or(|folder| request.folder.as_ref() == Some(folder))
+}
+
+/// Returns a concise collection runner status message.
+fn collection_run_status_message(run: &CollectionRun) -> String {
+    let state = if run.is_running() {
+        "running"
+    } else {
+        "finished"
+    };
+    format!(
+        "Runner {state}: {} {}/{} complete, {} passed, {} failed",
+        run.target.label(),
+        run.completed(),
+        run.total,
+        run.passed(),
+        run.failed()
     )
 }
 
@@ -3082,6 +3405,152 @@ mod tests {
 
         app.history_search.set_content("orders");
         assert_eq!(app.filtered_saved_indices(), vec![1]);
+    }
+
+    /// Runner target follows the selected saved request folder when present.
+    #[test]
+    fn collection_runner_targets_selected_folder() {
+        let mut app = app_with_saved_requests(vec![
+            saved_request_in(
+                "List users",
+                HttpMethod::Get,
+                "https://example.com/users",
+                "Identity",
+                Some("Users"),
+            ),
+            saved_request_in(
+                "Create user",
+                HttpMethod::Post,
+                "https://example.com/users",
+                "Identity",
+                Some("Users"),
+            ),
+            saved_request_in(
+                "List tokens",
+                HttpMethod::Get,
+                "https://example.com/tokens",
+                "Identity",
+                Some("Tokens"),
+            ),
+        ]);
+        app.saved_index = 0;
+
+        app.handle_key(ctrl_key(KeyCode::Char('g')));
+
+        let run = app.collection_run.as_ref().expect("runner should start");
+        assert_eq!(run.target.collection, "Identity");
+        assert_eq!(run.target.folder.as_deref(), Some("Users"));
+        assert_eq!(run.total, 2);
+        assert_eq!(run.current_request.as_deref(), Some("List users"));
+        assert_eq!(run.queue, vec![1]);
+        assert!(app.pending_request.is_some());
+        assert_eq!(app.active_tab().response_tab, ResponseTab::Runner);
+    }
+
+    /// Runner target expands to the whole collection for root-level requests.
+    #[test]
+    fn collection_runner_targets_collection_when_selected_request_has_no_folder() {
+        let mut app = app_with_saved_requests(vec![
+            saved_request_in(
+                "Health",
+                HttpMethod::Get,
+                "https://example.com/health",
+                "Identity",
+                None,
+            ),
+            saved_request_in(
+                "List users",
+                HttpMethod::Get,
+                "https://example.com/users",
+                "Identity",
+                Some("Users"),
+            ),
+            saved_request_in(
+                "List orders",
+                HttpMethod::Get,
+                "https://example.com/orders",
+                "Commerce",
+                None,
+            ),
+        ]);
+        app.saved_index = 0;
+
+        app.handle_key(ctrl_key(KeyCode::Char('g')));
+
+        let run = app.collection_run.as_ref().expect("runner should start");
+        assert_eq!(run.target.collection, "Identity");
+        assert_eq!(run.target.folder, None);
+        assert_eq!(run.total, 2);
+        assert_eq!(run.current_request.as_deref(), Some("Health"));
+        assert_eq!(run.queue, vec![1]);
+    }
+
+    /// Runner resolves saved request templates with the active environment.
+    #[test]
+    fn collection_runner_resolves_saved_request_environment_variables() {
+        let mut saved = saved_request_in(
+            "List users",
+            HttpMethod::Get,
+            "{{base_url}}/users",
+            "Identity",
+            Some("Users"),
+        );
+        saved.auth = RequestAuth::Bearer {
+            token: "{{token}}".to_string(),
+        };
+        let mut app = app_with_saved_requests(vec![saved]);
+        app.environments = vec![environment("Local", "http://localhost:8080")];
+        app.environment_index = Some(0);
+        app.saved_index = 0;
+
+        app.handle_key(ctrl_key(KeyCode::Char('g')));
+
+        let pending = app
+            .pending_request
+            .as_ref()
+            .expect("runner request should be queued");
+        assert_eq!(pending.request.url, "http://localhost:8080/users");
+        assert_eq!(
+            pending.request.auth,
+            RequestAuth::Bearer {
+                token: "abc123".to_string()
+            }
+        );
+        assert_eq!(pending.runner_request_name.as_deref(), Some("List users"));
+    }
+
+    /// Runner records pass and failure counts from completed results.
+    #[test]
+    fn collection_runner_counts_completed_results() {
+        let mut app = app_with_saved_requests(vec![saved_request_in(
+            "List users",
+            HttpMethod::Get,
+            "https://example.com/users",
+            "Identity",
+            Some("Users"),
+        )]);
+        app.saved_index = 0;
+        app.handle_key(ctrl_key(KeyCode::Char('g')));
+
+        app.complete_collection_run_request(CollectionRunResult {
+            name: "List users".to_string(),
+            method: HttpMethod::Get,
+            url: "https://example.com/users".to_string(),
+            status_code: Some(200),
+            duration_ms: Some(15),
+            tests_passed: 1,
+            tests_total: 1,
+            error: None,
+        });
+
+        let run = app.collection_run.as_ref().expect("runner should exist");
+        assert_eq!(run.completed(), 1);
+        assert_eq!(run.passed(), 1);
+        assert_eq!(run.failed(), 0);
+        assert_eq!(
+            app.status_message,
+            "Runner finished: Identity/Users 1/1 complete, 1 passed, 0 failed"
+        );
     }
 
     /// Saving the current composer pins a reusable request and selects saved mode.

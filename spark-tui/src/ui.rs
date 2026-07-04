@@ -16,8 +16,8 @@ use tui_piechart::{
 };
 
 use crate::app::{
-    App, CollectionIoDialogField, CollectionIoMode, Focus, ResponseTab, SaveDialogField,
-    SidebarMode,
+    App, CollectionIoDialogField, CollectionIoMode, CollectionRun, CollectionRunResult, Focus,
+    ResponseTab, SaveDialogField, SidebarMode,
 };
 
 /// Millisecond threshold at which durations switch to seconds.
@@ -31,9 +31,11 @@ const PRAGMA_HEADER: &str = "pragma";
 /// Always-visible footer navigation key help.
 const VIM_NAV_KEY_HELP: &str = "j/k move  h/l switch  H/L tabs  Tab focus  Enter open/send  q quit";
 /// Always-visible footer action key help.
-const VIM_ACTION_KEY_HELP: &str = "n new  x close  r rename  p save  I import  X export  e env";
+const VIM_ACTION_KEY_HELP: &str =
+    "n new  x close  r rename  p save  I import  X export  R run  e env";
 /// Always-visible legacy control shortcut help.
-const CONTROL_KEY_HELP: &str = "^S send ^P save ^L import ^X export ^T new ^W close ^R ren ^O side";
+const CONTROL_KEY_HELP: &str =
+    "^S send ^P save ^L import ^X export ^G run ^T new ^W close ^R ren ^O side";
 
 /// Operating-system family used to label visible key help.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -812,14 +814,26 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    if active_tab.response_tab == ResponseTab::History {
-        render_response_history_chart(frame, &app.history, content_area);
-        return;
+    match active_tab.response_tab {
+        ResponseTab::History => {
+            render_response_history_chart(frame, &app.history, content_area);
+            return;
+        }
+        ResponseTab::Runner => {
+            let para = Paragraph::new(render_collection_run_text(app.collection_run.as_ref()))
+                .wrap(Wrap { trim: false })
+                .scroll((active_tab.response_scroll, 0));
+            frame.render_widget(para, content_area);
+            return;
+        }
+        _ => {}
     }
 
     let content: Text = match (&active_tab.response, &active_tab.response_tab) {
         (None, _) if app.is_sending() => Text::raw("Sending request..."),
-        (None, _) | (Some(_), ResponseTab::History) => Text::raw(String::new()),
+        (None, _) | (Some(_), ResponseTab::History | ResponseTab::Runner) => {
+            Text::raw(String::new())
+        }
         (Some(resp), ResponseTab::Body) => render_response_body_text(resp),
         (Some(resp), ResponseTab::Cookies) => render_response_cookies_text(resp),
         (Some(resp), ResponseTab::Headers) => render_response_headers_text(resp),
@@ -841,6 +855,9 @@ fn render_response(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Returns the response pane title, if current state should display one.
 fn response_title(app: &App) -> Option<Line<'static>> {
+    if app.is_collection_run_active() {
+        return Some(Line::raw(" Response  Runner active "));
+    }
     if app.is_sending() {
         return Some(Line::raw(" Response  Sending... "));
     }
@@ -855,6 +872,94 @@ fn response_title(app: &App) -> Option<Line<'static>> {
             Span::raw(" "),
         ])
     })
+}
+
+/// Builds collection runner tab text.
+fn render_collection_run_text(run: Option<&CollectionRun>) -> Text<'static> {
+    let Some(run) = run else {
+        return Text::raw("No collection run yet. Select a saved request and press Ctrl+G.");
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            run.target.label(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        metadata_line("Progress", &format!("{}/{}", run.completed(), run.total)),
+        metadata_line("Passed", &run.passed().to_string()),
+        metadata_line("Failed", &run.failed().to_string()),
+    ];
+
+    if let Some(current) = &run.current_request {
+        lines.push(metadata_line("Running", current));
+    }
+    if run.results.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Waiting for the first request result.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return Text::from(lines);
+    }
+
+    lines.push(Line::raw(""));
+    for result in &run.results {
+        push_collection_run_result(&mut lines, result);
+    }
+
+    Text::from(lines)
+}
+
+/// Adds one collection runner result line.
+fn push_collection_run_result(lines: &mut Vec<Line<'static>>, result: &CollectionRunResult) {
+    let marker = if result.passed() { "PASS" } else { "FAIL" };
+    let marker_style = if result.passed() {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    let status = result.status_code.map_or_else(
+        || "ERR".to_string(),
+        |code| {
+            format!(
+                "{code} {}",
+                format_duration(result.duration_ms.unwrap_or_default())
+            )
+        },
+    );
+    let tests = if result.tests_total == 0 {
+        "tests -".to_string()
+    } else {
+        format!("tests {}/{}", result.tests_passed, result.tests_total)
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("{marker:<4} "), marker_style),
+        Span::styled(
+            format!("{:<7}", result.method.as_str()),
+            Style::default()
+                .fg(method_color(result.method))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{status:<12}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(format!("{tests:<12}"), Style::default().fg(Color::DarkGray)),
+        Span::raw(result.name.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("     "),
+        Span::styled(result.url.clone(), Style::default().fg(Color::DarkGray)),
+    ]));
+    if let Some(error) = &result.error {
+        lines.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(error.clone(), Style::default().fg(Color::Red)),
+        ]));
+    }
 }
 
 /// Returns the filled badge style for a response status code.
